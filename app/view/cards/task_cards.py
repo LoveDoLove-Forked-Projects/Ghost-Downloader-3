@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QPoint, Signal, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QApplication
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QApplication, QWidget, QSizePolicy
 from qfluentwidgets import (
     Action, CardWidget, CheckBox, FluentIcon, ImageLabel,
     IndeterminateProgressBar, PrimaryToolButton, ProgressBar,
@@ -17,11 +18,82 @@ from app.config.cfg import cfg
 from app.format import toReadableSize, toReadableTime
 from app.models.task import TaskStatus, SpecialFileSize
 from app.platform.desktop import openFile, revealInFolder
-from app.services.task_service import taskService
 from app.view.components.labels import IconBodyLabel, IconStrongBodyLabel
 
 if TYPE_CHECKING:
     from app.models.task import Task
+
+
+@dataclass(frozen=True)
+class FieldSpec:
+    name: str
+    icon: FluentIcon
+    formats: dict[TaskStatus | None, Callable]
+
+
+@dataclass(frozen=True)
+class ButtonState:
+    icon: FluentIcon | None = None
+    visible: bool = True
+    enabled: bool = True
+
+
+BUTTON_DEFAULT = ButtonState()
+BUTTON_HIDDEN = ButtonState(visible=False)
+
+
+@dataclass(frozen=True)
+class ButtonSpec:
+    name: str
+    icon: FluentIcon
+    tooltip: str
+    buttonType: type = ToolButton
+    states: dict[TaskStatus | None, Callable] | None = None
+    default: ButtonState = field(default=BUTTON_DEFAULT)
+
+
+def toEtaText(task: Task, speed: int, received: int) -> str:
+    if task.fileSize > 0 and speed > 0:
+        return toReadableTime(int((task.fileSize - received) / speed))
+    return "--"
+
+
+def toSizeText(task: Task, speed: int, received: int) -> str | None:
+    if task.status == TaskStatus.COMPLETED:
+        return toReadableSize(task.fileSize) if task.fileSize > 0 else None
+    if task.fileSize > 0:
+        return f"{toReadableSize(received)}/{toReadableSize(task.fileSize)}"
+    return f"{toReadableSize(received)}/--"
+
+
+SPEED_FIELD = FieldSpec("speed", FluentIcon.SPEED_HIGH, {
+    TaskStatus.RUNNING: lambda t, s, r: f"{toReadableSize(s)}/s",
+})
+ETA_FIELD = FieldSpec("eta", FluentIcon.STOP_WATCH, {TaskStatus.RUNNING: toEtaText})
+SIZE_FIELD = FieldSpec("size", FluentIcon.LIBRARY, {None: toSizeText})
+
+TOGGLE_BUTTON = ButtonSpec("toggle", FluentIcon.PLAY, "暂停/继续", PrimaryToolButton, states={
+    TaskStatus.RUNNING: lambda t: ButtonState(icon=FluentIcon.PAUSE, enabled=t.canPause),
+    TaskStatus.COMPLETED: lambda t: ButtonState(enabled=False),
+})
+
+SELECT_FILES_BUTTON = ButtonSpec("selectFiles", FluentIcon.LIBRARY, "选择文件",
+    states={None: lambda t: ButtonState(visible=bool(t.files) and len(t.files) > 1)})
+
+VERIFY_HASH_BUTTON = ButtonSpec("verifyHash", FluentIcon.FINGERPRINT, "校验文件哈希",
+    default=BUTTON_HIDDEN,
+    states={
+        TaskStatus.COMPLETED: lambda t: ButtonState(
+            enabled=t.hasOutputFile and Path(t.outputPath).exists()),
+    })
+
+OPEN_FILE_BUTTON = ButtonSpec("openFile", FluentIcon.LINK, "打开文件", states={
+    TaskStatus.COMPLETED: lambda t: ButtonState(
+        enabled=not t.hasOutputFile or Path(t.outputPath).exists()),
+})
+
+OPEN_FOLDER_BUTTON = ButtonSpec("openFolder", FluentIcon.FOLDER, "打开文件夹")
+DELETE_BUTTON = ButtonSpec("delete", FluentIcon.CLOSE, "删除", TransparentToolButton)
 
 
 class TaskCard(CardWidget):
@@ -29,26 +101,257 @@ class TaskCard(CardWidget):
     selectionChanged = Signal(bool, bool)
     dragRequested = Signal(str)
 
-    def __init__(self, task: Task, parent=None):
+    infoFields: list[FieldSpec] = [SPEED_FIELD, ETA_FIELD, SIZE_FIELD]
+    nameFormats: dict[TaskStatus, Callable] = {}
+    buttons: list[ButtonSpec] = [
+        TOGGLE_BUTTON, SELECT_FILES_BUTTON, VERIFY_HASH_BUTTON,
+        OPEN_FILE_BUTTON, OPEN_FOLDER_BUTTON, DELETE_BUTTON,
+    ]
+
+    speedLabel: IconBodyLabel
+    etaLabel: IconBodyLabel
+    sizeLabel: IconBodyLabel
+    toggleButton: PrimaryToolButton
+    selectFilesButton: ToolButton
+    verifyHashButton: ToolButton
+    openFileButton: ToolButton
+    openFolderButton: ToolButton
+    deleteButton: TransparentToolButton
+
+    def __init__(self, task: Task, taskService, featureService, categoryService, parent=None):
         super().__init__(parent)
         self._task = task
+        self._taskService = taskService
+        self._featureService = featureService
+        self._categoryService = categoryService
         self._isSelectionMode = False
         self._isFileMissing = False
         self._isDragPending = False
         self._hasDragged = False
         self._dragStartPos = QPoint()
+        self._lastStatus: TaskStatus | None = None
+        self._hashDigest: str = ""
+
+        self.setFixedHeight(self.ROW_HEIGHT)
 
         self.checkBox = CheckBox(self)
-        self.checkBox.setFixedSize(23, 23)
-        self.checkBox.setVisible(False)
-        self.checkBox.clicked.connect(lambda checked: self.selectionChanged.emit(checked, False))
+        self.iconLabel = ImageLabel(self)
+        self.nameLabel = IconStrongBodyLabel(task.name, self)
+        self.statusLabel = IconBodyLabel("", FluentIcon.INFO, self)
+        self.statusLabel.hide()
+
+        for f in self.infoFields:
+            setattr(self, f"{f.name}Label", IconBodyLabel("", f.icon, self))
+
+        for spec in self.buttons:
+            setattr(self, f"{spec.name}Button", spec.buttonType(spec.icon, self))
+
+        self.progressBar = self._createProgressBar()
+
+        self._initWidget()
+        self._initLayout()
+        self._bind()
+        self._refreshIcon()
+        self._refreshCategoryIcon()
 
     @property
     def task(self) -> Task:
         return self._task
 
+    def _createProgressBar(self) -> QWidget:
+        if self._task.fileSize in {SpecialFileSize.UNKNOWN, SpecialFileSize.NOT_SUPPORTED}:
+            return IndeterminateProgressBar(self)
+        bar = ProgressBar(self)
+        bar.setCustomBackgroundColor(QColor(0, 0, 0, 0), QColor(0, 0, 0, 0))
+        return bar
+
+    def _initWidget(self) -> None:
+        self.iconLabel.setFixedSize(48, 48)
+        self.checkBox.setFixedSize(23, 23)
+        self.checkBox.setVisible(False)
+        self.nameLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        for spec in self.buttons:
+            if spec.tooltip:
+                button = getattr(self, f"{spec.name}Button")
+                button.setToolTip(self.tr(spec.tooltip))
+                button.installEventFilter(ToolTipFilter(button))
+
+    def _initLayout(self) -> None:
+        infoLayout = QHBoxLayout()
+        for f in self.infoFields:
+            infoLayout.addWidget(getattr(self, f"{f.name}Label"))
+        infoLayout.addWidget(self.statusLabel)
+        infoLayout.addStretch()
+
+        contentLayout = QVBoxLayout()
+        contentLayout.setContentsMargins(2, 8, 2, 8)
+        contentLayout.addWidget(self.nameLabel)
+        contentLayout.addLayout(infoLayout)
+
+        self.hBoxLayout = QHBoxLayout(self)
+        self.hBoxLayout.setContentsMargins(12, 0, 12, 0)
+        self.hBoxLayout.addWidget(self.checkBox)
+        self.hBoxLayout.addWidget(self.iconLabel)
+        self.hBoxLayout.addLayout(contentLayout, 1)
+        for spec in self.buttons:
+            self.hBoxLayout.addWidget(getattr(self, f"{spec.name}Button"))
+
+    def _bind(self) -> None:
+        self.toggleButton.clicked.connect(self._onToggleClicked)
+        self.verifyHashButton.clicked.connect(self._onVerifyHashClicked)
+        self.openFileButton.clicked.connect(lambda: openFile(self._task.outputPath))
+        self.openFolderButton.clicked.connect(lambda: revealInFolder(self._task.outputPath))
+        self.deleteButton.clicked.connect(self._onDeleteClicked)
+        self.checkBox.clicked.connect(lambda checked: self.selectionChanged.emit(checked, False))
+        self.selectFilesButton.clicked.connect(self._onSelectFilesClicked)
+        cfg.isCategoryEnabled.valueChanged.connect(self._refreshCategoryIcon)
+        self._categoryService.categoriesChanged.connect(self._refreshCategoryIcon)
+
     def refresh(self, force: bool = False) -> None:
+        if not force and self._lastStatus == self._task.status and self._task.status != TaskStatus.RUNNING:
+            return
+
+        task = self._task
+        progress, speed, receivedBytes = task.currentSnapshot()
+        self.progressBar.setValue(int(progress))
+
+        for f in self.infoFields:
+            label = getattr(self, f"{f.name}Label")
+            formatter = f.formats.get(task.status) or f.formats.get(None)
+            if formatter is None:
+                label.hide()
+                continue
+            text = formatter(task, speed, receivedBytes)
+            if text is None:
+                label.hide()
+            else:
+                label.setText(text)
+                label.show()
+
+        nameFormatter = self.nameFormats.get(task.status)
+        if nameFormatter:
+            text = nameFormatter(task, speed, receivedBytes)
+            if text is not None:
+                self.nameLabel.setText(text)
+
+        self._refreshForStatus(task)
+        self._refreshButtons()
+        self._lastStatus = task.status
+
+    def _refreshForStatus(self, task: Task) -> None:
+        self._isFileMissing = False
+
+        if task.status == TaskStatus.RUNNING:
+            self.progressBar.setError(False)
+            self.statusLabel.hide()
+            self.progressBar.show()
+
+        elif task.status == TaskStatus.COMPLETED:
+            self.progressBar.pause()
+            self.progressBar.hide()
+            self._isFileMissing = task.hasOutputFile and not Path(task.outputPath).exists()
+            if self._isFileMissing:
+                self._setStatus(self.tr("文件不存在"))
+                self.statusLabel.setTextColor(QColor(200, 160, 80), QColor(200, 170, 100))
+            elif task.completedAt:
+                from datetime import datetime
+                self._setStatus(self.tr("完成于 {}").format(
+                    datetime.fromtimestamp(task.completedAt).strftime("%Y-%m-%d %H:%M:%S")))
+            else:
+                self._setStatus(self.tr("任务已经完成"))
+            self.nameLabel.setText(task.name)
+            self._refreshIcon()
+
+        elif task.status == TaskStatus.FAILED:
+            self.progressBar.setError(True)
+            error = task.lastError
+            if error:
+                from PySide6.QtCore import QCoreApplication
+                text = QCoreApplication.translate("TaskErrors", error.message)
+                self._setStatus(text.format_map(error.params) if error.params else text)
+            else:
+                self._setStatus(self.tr("下载过程中发生错误，请稍后重试"))
+
+        else:
+            self.progressBar.setError(False)
+            self.progressBar.pause()
+            if task.status == TaskStatus.PAUSED:
+                self._setStatus(self.tr("任务已经暂停"))
+            elif task.status == TaskStatus.WAITING:
+                self._setStatus(self.tr("任务正在等待"))
+
+    def _setStatus(self, text: str) -> None:
+        self.statusLabel.setTextColor()
+        self.statusLabel.setText(text)
+        self.statusLabel.show()
+
+    def _refreshIcon(self) -> None:
+        from PySide6.QtCore import QFileInfo
+        from PySide6.QtWidgets import QFileIconProvider
+        self.iconLabel.setPixmap(QFileIconProvider().icon(QFileInfo(self._task.outputPath)).pixmap(48, 48))
+        self.iconLabel.setFixedSize(48, 48)
+
+    def _refreshCategoryIcon(self) -> None:
+        if not cfg.isCategoryEnabled.value or not self._task.category:
+            self.nameLabel.setIcon(None)
+            return
+        category = self._categoryService.categoryById(self._task.category)
+        if category is None:
+            self.nameLabel.setIcon(None)
+            return
+        self.nameLabel.setIcon(category.toIcon())
+
+    def _refreshButtons(self, names=None) -> None:
+        for spec in self.buttons:
+            if names is not None and spec.name not in names:
+                continue
+            if spec.states is None:
+                continue
+            button = getattr(self, f"{spec.name}Button")
+            fn = spec.states.get(self._task.status) or spec.states.get(None)
+            state = fn(self._task) if fn else spec.default
+            if state.icon is not None:
+                button.setIcon(state.icon)
+            button.setVisible(state.visible)
+            button.setEnabled(state.enabled)
+
+    def _onToggleClicked(self) -> None:
+        if self._task.status == TaskStatus.RUNNING:
+            self._taskService.pause(self._task)
+        else:
+            self._taskService.start(self._task)
+        self.refresh()
+
+    def _onSelectFilesClicked(self) -> None:
         pass
+
+    def _onDeleteClicked(self) -> None:
+        from qfluentwidgets import MessageBox
+        dialog = MessageBox(self.tr("删除任务"), self.tr("确定要删除这个下载任务吗？"), self.window())
+        deleteFiles = CheckBox(self.tr("同时删除已下载的文件"))
+        deleteFiles.setChecked(cfg.shouldDeleteFilesOnRemove.value)
+        dialog.textLayout.addWidget(deleteFiles)
+        if dialog.exec():
+            cfg.set(cfg.shouldDeleteFilesOnRemove, deleteFiles.isChecked())
+            self._taskService.delete(self._task, deleteFiles.isChecked())
+
+    def _onVerifyHashClicked(self) -> None:
+        if not Path(self._task.outputPath).is_file():
+            self._setStatus(self.tr("文件不存在，无法校验"))
+            return
+        from app.view.dialogs.file_hash import FileHashDialog
+        dialog = FileHashDialog(self._task.outputPath, self.window())
+        dialog.hashReady.connect(self._onHashReady)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _onHashReady(self, algorithm: str, digest: str) -> None:
+        self._hashDigest = f"{algorithm}: {digest}"
+        self._setStatus(self._hashDigest)
+
+    def _onEditClicked(self) -> None:
+        self._featureService.createEditDialog(self._task, self.window()).exec()
+        self.refresh()
 
     def setSelectionMode(self, enter: bool) -> None:
         self._isSelectionMode = enter
@@ -65,12 +368,17 @@ class TaskCard(CardWidget):
             self.checkBox.setChecked(checked)
             self.update()
 
-    def buildContextMenu(self) -> RoundMenu:
+    def createContextMenu(self) -> RoundMenu:
         menu = RoundMenu(parent=self)
 
         copyUrl = Action(FluentIcon.COPY, self.tr("复制下载链接"), self)
         copyUrl.triggered.connect(lambda: QApplication.clipboard().setText(self._task.url))
         menu.addAction(copyUrl)
+
+        if self._hashDigest:
+            copyHash = Action(FluentIcon.FINGERPRINT, self.tr("复制校验值"), self)
+            copyHash.triggered.connect(lambda: QApplication.clipboard().setText(self._hashDigest))
+            menu.addAction(copyHash)
 
         if self._task.canEdit and self._task.status != TaskStatus.COMPLETED:
             edit = Action(FluentIcon.EDIT, self.tr("编辑任务参数..."), self)
@@ -78,36 +386,24 @@ class TaskCard(CardWidget):
             menu.addAction(edit)
 
         redownload = Action(FluentIcon.UPDATE, self.tr("重新下载"), self)
-        redownload.triggered.connect(lambda: taskService.redownload(self._task))
+        redownload.triggered.connect(lambda: self._taskService.redownload(self._task))
         menu.addAction(redownload)
 
         if cfg.isCategoryEnabled.value:
-            from app.services.category_service import categoryService
             moveMenu = RoundMenu(self.tr("移动到分类"), self)
             moveMenu.setIcon(FluentIcon.TAG)
             uncategorized = Action(FluentIcon.MORE, self.tr("未分类"), self)
-            uncategorized.triggered.connect(lambda: taskService.setCategory(self._task, ""))
+            uncategorized.triggered.connect(lambda: self._taskService.setCategory(self._task, ""))
             moveMenu.addAction(uncategorized)
             moveMenu.addSeparator()
-            for category in categoryService.categories():
+            for category in self._categoryService.categories():
                 cid = category.categoryId
                 action = Action(category.toIcon(), category.name, self)
-                action.triggered.connect(lambda checked=False, c=cid: taskService.setCategory(self._task, c))
+                action.triggered.connect(lambda checked=False, c=cid: self._taskService.setCategory(self._task, c))
                 moveMenu.addAction(action)
             menu.addMenu(moveMenu)
 
         return menu
-
-    def _onEditClicked(self) -> None:
-        from app.services.feature_service import featureService
-        from app.view.dialogs.edit_task import LiveEditDialog
-        LiveEditDialog(self._task, featureService.editCards(self._task, self.window()), self.window()).exec()
-        self.refresh()
-
-    def _canDrag(self) -> bool:
-        return (self._task.status == TaskStatus.COMPLETED
-                and self._task.hasOutputFile
-                and Path(self._task.outputPath).exists())
 
     def mousePressEvent(self, e) -> None:
         super().mousePressEvent(e)
@@ -139,7 +435,7 @@ class TaskCard(CardWidget):
             openFile(self._task.outputPath)
 
     def contextMenuEvent(self, e) -> None:
-        menu = self.buildContextMenu()
+        menu = self.createContextMenu()
         menu.exec(e.globalPos())
         e.accept()
 
@@ -153,240 +449,36 @@ class TaskCard(CardWidget):
             painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), r, r)
         super().paintEvent(e)
 
-
-class UniversalTaskCard(TaskCard):
-
-    def __init__(self, task: Task, parent=None):
-        super().__init__(task, parent)
-        self.setFixedHeight(self.ROW_HEIGHT)
-        self._lastStatus: TaskStatus | None = None
-        self._hashDigest: str = ""
-
-        self.iconLabel = ImageLabel(self)
-        self.nameLabel = IconStrongBodyLabel(task.name, self)
-        self.speedLabel = IconBodyLabel("", FluentIcon.SPEED_HIGH, self)
-        self.etaLabel = IconBodyLabel("", FluentIcon.STOP_WATCH, self)
-        self.sizeLabel = IconBodyLabel("", FluentIcon.LIBRARY, self)
-        self.statusLabel = IconBodyLabel("", FluentIcon.INFO, self)
-        self.toggleButton = PrimaryToolButton(FluentIcon.PAUSE, self)
-        self.verifyHashButton = ToolButton(FluentIcon.FINGERPRINT, self)
-        self.openFileButton = ToolButton(FluentIcon.LINK, self)
-        self.openFolderButton = ToolButton(FluentIcon.FOLDER, self)
-        self.deleteButton = TransparentToolButton(FluentIcon.CLOSE, self)
-        self.statusLabel.hide()
-        self.progressBar = self._buildProgressBar()
-
-        self._initWidget()
-        self._initLayout()
-        self._bind()
-        self._refreshIcon()
-        self._refreshCategoryIcon()
-
-    def _buildProgressBar(self) -> QWidget:
-        if self._task.fileSize in {SpecialFileSize.UNKNOWN, SpecialFileSize.NOT_SUPPORTED}:
-            return IndeterminateProgressBar(self)
-        bar = ProgressBar(self)
-        bar.setCustomBackgroundColor(QColor(0, 0, 0, 0), QColor(0, 0, 0, 0))
-        return bar
-
-    def _initWidget(self) -> None:
-        from PySide6.QtWidgets import QSizePolicy
-        self.iconLabel.setFixedSize(48, 48)
-        self.nameLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        for btn, tip in (
-            (self.verifyHashButton, self.tr("校验文件哈希")),
-            (self.openFileButton, self.tr("打开文件")),
-            (self.openFolderButton, self.tr("打开文件夹")),
-        ):
-            btn.setToolTip(tip)
-            btn.installEventFilter(ToolTipFilter(btn))
-
-    def _initLayout(self) -> None:
-        infoLayout = QHBoxLayout()
-        infoLayout.addWidget(self.speedLabel)
-        infoLayout.addWidget(self.etaLabel)
-        infoLayout.addWidget(self.sizeLabel)
-        infoLayout.addWidget(self.statusLabel)
-        infoLayout.addStretch()
-
-        contentLayout = QVBoxLayout()
-        contentLayout.setContentsMargins(2, 8, 2, 8)
-        contentLayout.addWidget(self.nameLabel)
-        contentLayout.addLayout(infoLayout)
-
-        self.hBoxLayout = QHBoxLayout(self)
-        self.hBoxLayout.setContentsMargins(12, 0, 12, 0)
-        self.hBoxLayout.addWidget(self.checkBox)
-        self.hBoxLayout.addWidget(self.iconLabel)
-        self.hBoxLayout.addLayout(contentLayout, 1)
-        self.hBoxLayout.addWidget(self.toggleButton)
-        self.hBoxLayout.addWidget(self.verifyHashButton)
-        self.hBoxLayout.addWidget(self.openFileButton)
-        self.hBoxLayout.addWidget(self.openFolderButton)
-        self.hBoxLayout.addWidget(self.deleteButton)
-
-    def _bind(self) -> None:
-        self.toggleButton.clicked.connect(self._onToggleClicked)
-        self.verifyHashButton.clicked.connect(self._onVerifyHashClicked)
-        self.openFileButton.clicked.connect(lambda: openFile(self._task.outputPath))
-        self.openFolderButton.clicked.connect(lambda: revealInFolder(self._task.outputPath))
-        self.deleteButton.clicked.connect(self._onDeleteClicked)
-
-        from app.services.category_service import categoryService
-        cfg.isCategoryEnabled.valueChanged.connect(self._refreshCategoryIcon)
-        categoryService.categoriesChanged.connect(self._refreshCategoryIcon)
-
-    def refresh(self, force: bool = False) -> None:
-        if not force and self._lastStatus == self._task.status and self._task.status != TaskStatus.RUNNING:
-            return
-
-        self._isFileMissing = False
-        task = self._task
-        progress, speed, receivedBytes = task.currentSnapshot()
-
-        self.progressBar.setValue(int(progress))
-
-        if task.fileSize > 0:
-            self.sizeLabel.setText(f"{toReadableSize(receivedBytes)}/{toReadableSize(task.fileSize)}")
-        else:
-            self.sizeLabel.setText(f"{toReadableSize(receivedBytes)}/--")
-
-        if task.status == TaskStatus.RUNNING:
-            self.progressBar.setError(False)
-            if self.statusLabel.isVisible():
-                self.statusLabel.hide()
-                self.progressBar.show()
-                self.speedLabel.show()
-                self.etaLabel.show()
-                self.sizeLabel.show()
-            self.speedLabel.setText(f"{toReadableSize(speed)}/s")
-            if task.fileSize > 0 and speed > 0:
-                self.etaLabel.setText(toReadableTime(int((task.fileSize - receivedBytes) / speed)))
-            else:
-                self.etaLabel.setText("--")
-
-        elif task.status == TaskStatus.COMPLETED:
-            self.progressBar.pause()
-            self.progressBar.hide()
-            if task.fileSize > 0:
-                self.sizeLabel.setText(toReadableSize(task.fileSize))
-            else:
-                self.sizeLabel.hide()
-            self._isFileMissing = task.hasOutputFile and not Path(task.outputPath).exists()
-            if self._isFileMissing:
-                statusText = self.tr("文件不存在")
-            elif task.completedAt:
-                from datetime import datetime
-                statusText = self.tr("完成于 {}").format(
-                    datetime.fromtimestamp(task.completedAt).strftime("%Y-%m-%d %H:%M:%S"))
-            else:
-                statusText = self.tr("任务已经完成")
-            self._showStatus(statusText)
-            if self._isFileMissing:
-                self.statusLabel.setTextColor(QColor(200, 160, 80), QColor(200, 170, 100))
-            self.nameLabel.setText(task.name)
-            self._refreshIcon()
-
-        elif task.status == TaskStatus.FAILED:
-            self.progressBar.setError(True)
-            error = task.lastError
-            if error:
-                from PySide6.QtCore import QCoreApplication
-                text = QCoreApplication.translate("TaskErrors", error.message)
-                self._showStatus(text.format_map(error.params) if error.params else text)
-            else:
-                self._showStatus(self.tr("下载过程中发生错误，请稍后重试"))
-
-        else:
-            self.progressBar.setError(False)
-            self.progressBar.pause()
-            if task.status == TaskStatus.PAUSED:
-                self._showStatus(self.tr("任务已经暂停"))
-            elif task.status == TaskStatus.WAITING:
-                self._showStatus(self.tr("任务正在等待"))
-
-        self._refreshButtons()
-        self._lastStatus = task.status
-
-    def _showStatus(self, text: str) -> None:
-        self.speedLabel.hide()
-        self.etaLabel.hide()
-        self.statusLabel.setTextColor()
-        self.statusLabel.setText(text)
-        self.statusLabel.show()
-
-    def _refreshIcon(self) -> None:
-        from PySide6.QtCore import QFileInfo
-        from PySide6.QtWidgets import QFileIconProvider
-        self.iconLabel.setPixmap(QFileIconProvider().icon(QFileInfo(self._task.outputPath)).pixmap(48, 48))
-        self.iconLabel.setFixedSize(48, 48)
-
-    def _refreshCategoryIcon(self) -> None:
-        if not cfg.isCategoryEnabled.value or not self._task.category:
-            self.nameLabel.setIcon(None)
-            return
-        from app.services.category_service import categoryService
-        category = categoryService.categoryById(self._task.category)
-        if category is None:
-            self.nameLabel.setIcon(None)
-            return
-        self.nameLabel.setIcon(category.toIcon())
-
-    def _refreshButtons(self) -> None:
-        if self._task.status == TaskStatus.RUNNING:
-            self.toggleButton.setIcon(FluentIcon.PAUSE)
-            self.toggleButton.setEnabled(self._task.canPause)
-        elif self._task.status == TaskStatus.COMPLETED:
-            self.toggleButton.setIcon(FluentIcon.PLAY)
-            self.toggleButton.setEnabled(False)
-        else:
-            self.toggleButton.setIcon(FluentIcon.PLAY)
-            self.toggleButton.setEnabled(True)
-
-        completed = self._task.status == TaskStatus.COMPLETED
-        self.verifyHashButton.setVisible(completed)
-        self.verifyHashButton.setEnabled(completed and not self._isFileMissing)
-        self.openFileButton.setEnabled(not completed or not self._isFileMissing)
-
-    def _onToggleClicked(self) -> None:
-        if self._task.status == TaskStatus.RUNNING:
-            taskService.pause(self._task)
-        else:
-            taskService.start(self._task)
-        self.refresh()
-
-    def _onDeleteClicked(self) -> None:
-        from qfluentwidgets import MessageBox
-        dialog = MessageBox(self.tr("删除任务"), self.tr("确定要删除这个下载任务吗？"), self.window())
-        deleteFiles = CheckBox(self.tr("同时删除已下载的文件"))
-        deleteFiles.setChecked(cfg.shouldDeleteFilesOnRemove.value)
-        dialog.textLayout.addWidget(deleteFiles)
-        if dialog.exec():
-            cfg.set(cfg.shouldDeleteFilesOnRemove, deleteFiles.isChecked())
-            taskService.delete(self._task, deleteFiles.isChecked())
-
-    def _onVerifyHashClicked(self) -> None:
-        if not Path(self._task.outputPath).is_file():
-            self._showStatus(self.tr("文件不存在，无法校验"))
-            return
-        from app.view.dialogs.file_hash import FileHashDialog
-        dialog = FileHashDialog(self._task.outputPath, self.window())
-        dialog.hashReady.connect(self._onHashReady)
-        dialog.exec()
-        dialog.deleteLater()
-
-    def _onHashReady(self, algorithm: str, digest: str) -> None:
-        self._hashDigest = f"{algorithm}: {digest}"
-        self._showStatus(self._hashDigest)
-
-    def buildContextMenu(self) -> RoundMenu:
-        menu = super().buildContextMenu()
-        if self._hashDigest:
-            copyHash = Action(FluentIcon.FINGERPRINT, self.tr("复制校验值"), self)
-            copyHash.triggered.connect(lambda: QApplication.clipboard().setText(self._hashDigest))
-            menu.insertAction(menu.actions()[1], copyHash)
-        return menu
+    def _canDrag(self) -> bool:
+        return (self._task.status == TaskStatus.COMPLETED
+                and self._task.hasOutputFile
+                and Path(self._task.outputPath).exists())
 
     def resizeEvent(self, e) -> None:
         self.progressBar.setGeometry(4, self.height() - 4, self.width() - 8, 4)
         super().resizeEvent(e)
+
+
+class MultiFileTaskCard(TaskCard):
+    fileSelectDialog: type | None = None
+
+    def _onSelectFilesClicked(self) -> None:
+        if self.fileSelectDialog is None:
+            return
+        dialog = self.fileSelectDialog(self._task, self.window())
+        try:
+            if dialog.exec():
+                self._taskService.applySelection(self._task, dialog.selectedIndexes())
+                self.refresh(force=True)
+        finally:
+            dialog.deleteLater()
+
+    def _refreshForStatus(self, task: Task) -> None:
+        super()._refreshForStatus(task)
+        if (task.files and len(task.files) > 1
+                and not self._isFileMissing
+                and task.status in {TaskStatus.WAITING, TaskStatus.COMPLETED}):
+            selected = sum(1 for f in task.files if f.selected)
+            self.statusLabel.setText(
+                self.tr("{0}/{1} 个文件").format(selected, len(task.files))
+            )

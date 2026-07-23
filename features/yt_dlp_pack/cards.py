@@ -6,13 +6,13 @@ from PySide6.QtWidgets import QAbstractItemView, QHBoxLayout, QHeaderView, QWidg
 from qfluentwidgets import (
     BodyLabel, ComboBox, FluentIcon, IndeterminateProgressRing,
     MessageBoxBase, PrimaryPushButton, ProgressBar, PushButton, SubtitleLabel,
-    ToolButton, ToolTipFilter, TransparentToolButton,
+    ToolTipFilter, TransparentToolButton,
 )
 
 from app.format import toReadableSize
 from app.models.task import TaskStatus
-from app.view.cards.draft_cards import UniversalDraftCard
-from app.view.cards.task_cards import UniversalTaskCard
+from app.view.cards.draft_cards import DraftCard
+from app.view.cards.task_cards import MultiFileTaskCard, FieldSpec, SPEED_FIELD, ETA_FIELD
 from app.view.components.tree_view import AutoSizingTreeView
 from .config import ytDlpConfig
 from .task import STEPS_PER_VIDEO, YouTubeTask
@@ -75,145 +75,35 @@ STEP_LABELS = {
 }
 
 
-class YtDlpDraftCard(UniversalDraftCard):
+def toYtDlpSizeText(task: YouTubeTask, speed: int, received: int) -> str | None:
+    if task.status == TaskStatus.COMPLETED:
+        if task.isPlaylist:
+            from PySide6.QtCore import QCoreApplication
+            videoCount = len(task.steps) // STEPS_PER_VIDEO
+            totalReceived = sum(s.receivedBytes for s in task.steps)
+            return QCoreApplication.translate("YtDlpTaskCard", "{0} 个视频 · {1}").format(
+                videoCount, toReadableSize(totalReceived))
+        return toReadableSize(task.fileSize) if task.fileSize > 0 else None
+    if task.fileSize > 0:
+        return f"{toReadableSize(received)}/{toReadableSize(task.fileSize)}"
+    return f"{toReadableSize(received)}/--"
 
-    def _initWidget(self) -> None:
-        super()._initWidget()
-        task: YouTubeTask = self._task
-        mediaInfo: dict = getattr(task, "_mediaInfo", {})
-        hasMediaInfo = bool(mediaInfo.get("formats"))
 
-        self._qualityTiers = buildQualityTiers(mediaInfo) if hasMediaInfo else [("bv*+ba/b", self.tr("最佳画质"))]
-        self._subtitleChoices = buildSubtitleChoices(mediaInfo) if hasMediaInfo else []
+YTDLP_SIZE_FIELD = FieldSpec("size", FluentIcon.LIBRARY, {None: toYtDlpSizeText})
 
-        self._mediaSpinner = IndeterminateProgressRing(self)
-        self._mediaSpinner.setFixedSize(20, 20)
-        self._mediaSpinner.setStrokeWidth(3)
-        self._mediaSpinner.setVisible(not hasMediaInfo)
 
-        self._qualityCombo = ComboBox(self)
-        self._qualityCombo.setMinimumWidth(160)
-        for _selector, label in self._qualityTiers:
-            self._qualityCombo.addItem(label)
-        if self._qualityTiers:
-            self._qualityCombo.setCurrentIndex(0)
-
-        self._subtitleButton = TransparentToolButton(FluentIcon.LANGUAGE, self)
-        self._subtitleButton.installEventFilter(ToolTipFilter(self._subtitleButton))
-        self._subtitleButton.setToolTip(self.tr("选择字幕"))
-        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
-
-        self._videoSelectButton = TransparentToolButton(FluentIcon.LIBRARY, self)
-        self._videoSelectButton.installEventFilter(ToolTipFilter(self._videoSelectButton))
-        self._videoSelectButton.setToolTip(self.tr("选择视频"))
-        self._videoSelectButton.setVisible(task.isPlaylist)
-
-        self._playlistSpinner = IndeterminateProgressRing(self)
-        self._playlistSpinner.setFixedSize(20, 20)
-        self._playlistSpinner.setStrokeWidth(3)
-        self._playlistSpinner.hide()
-
-        if not hasMediaInfo:
-            self._startMediaInfoFetch()
-
-    def _initLayout(self) -> None:
-        super()._initLayout()
-        self.layout().addWidget(self._mediaSpinner)
-        self.layout().addWidget(self._qualityCombo)
-        self.layout().addWidget(self._subtitleButton)
-        self.layout().addWidget(self._videoSelectButton)
-        self.layout().addWidget(self._playlistSpinner)
-
-    def _bind(self) -> None:
-        super()._bind()
-        self._qualityCombo.currentIndexChanged.connect(self._onQualityChanged)
-        self._subtitleButton.clicked.connect(self._onSubtitleClicked)
-        self._videoSelectButton.clicked.connect(self._onVideoSelectClicked)
-
-    def _startMediaInfoFetch(self) -> None:
-        from app.services.coroutine_runner import coroutineRunner
-        from features.yt_dlp_pack.pack import YouTubeParser
-        parser = YouTubeParser()
-        coroutineRunner.submit(
-            parser.fetchFormats(self._task.url),
-            done=self._onMediaInfoLoaded,
-            failed=self._onMediaInfoFailed,
-            owner=self,
-        )
-
-    def _onMediaInfoLoaded(self, mediaInfo: dict) -> None:
-        self._mediaSpinner.hide()
-        if not mediaInfo:
-            return
-        task: YouTubeTask = self._task
-        task._mediaInfo = mediaInfo
-
-        try:
-            fileSize = int(float(mediaInfo.get("filesize_approx") or 0))
-        except (TypeError, ValueError):
-            fileSize = 0
-        if fileSize:
-            task.fileSize = fileSize
-            self.sizeLabel.setText(toReadableSize(fileSize))
-
-        self._qualityTiers = buildQualityTiers(mediaInfo)
-        self._qualityCombo.clear()
-        for _selector, label in self._qualityTiers:
-            self._qualityCombo.addItem(label)
-        if self._qualityTiers:
-            self._qualityCombo.setCurrentIndex(0)
-
-        self._subtitleChoices = buildSubtitleChoices(mediaInfo)
-        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
-
-    def _onMediaInfoFailed(self, error: str) -> None:
-        self._mediaSpinner.hide()
-
-    def _onQualityChanged(self, index: int) -> None:
-        if 0 <= index < len(self._qualityTiers):
-            self._task.videoFormatFilter = self._qualityTiers[index][0]
-
-    def _onSubtitleClicked(self) -> None:
-        dialog = SubtitleSelectDialog(self._subtitleChoices, self.window())
-        if dialog.exec():
-            langs, includeAuto = dialog.selectedLanguages()
-            self._task.subtitleLanguages = langs
-            self._task.shouldIncludeAutoSubs = includeAuto
-
-    def _onVideoSelectClicked(self) -> None:
-        task: YouTubeTask = self._task
-        if not task.files:
-            self._videoSelectButton.hide()
-            self._playlistSpinner.show()
-            from app.services.coroutine_runner import coroutineRunner
-            from features.yt_dlp_pack.pack import YouTubeParser
-            parser = YouTubeParser()
-            coroutineRunner.submit(
-                parser.fetchPlaylist(task.url),
-                done=self._onPlaylistLoaded,
-                failed=self._onPlaylistFailed,
-            )
-            return
-        dialog = VideoSelectDialog(task.files, self.window())
-        if dialog.exec():
-            task.setSelection(dialog.selectedIndices())
-            self.nameLabel.setText(task.name)
-
-    def _onPlaylistLoaded(self, videos: list[dict]) -> None:
-        self._playlistSpinner.hide()
-        self._videoSelectButton.show()
-        task: YouTubeTask = self._task
-        if videos:
-            task.setVideos(videos)
-            self._onVideoSelectClicked()
-        else:
-            self._videoSelectButton.setEnabled(False)
-            self._videoSelectButton.setToolTip(self.tr("未找到播放列表"))
-
-    def _onPlaylistFailed(self, error: str) -> None:
-        self._playlistSpinner.hide()
-        self._videoSelectButton.show()
-        self._videoSelectButton.setToolTip(self.tr("加载播放列表失败"))
+def toYtDlpNameText(task: YouTubeTask, speed: int, received: int) -> str | None:
+    currentStep = next((s for s in task.steps if s.status == TaskStatus.RUNNING), None)
+    if not currentStep:
+        return None
+    fileIndex = currentStep.fileIndex or 0
+    stepInGroup = currentStep.stepIndex - fileIndex * STEPS_PER_VIDEO
+    label = STEP_LABELS.get(stepInGroup, "")
+    if task.isPlaylist:
+        videoCount = len(task.steps) // STEPS_PER_VIDEO
+        videoStem = getattr(currentStep, "videoStem", "") or task.name
+        return f"{videoStem} ({fileIndex + 1}/{videoCount} · {label})" if label else None
+    return f"{task.name} ({label})" if label else None
 
 
 class SubtitleSelectDialog(MessageBoxBase):
@@ -304,9 +194,9 @@ class SubtitleSelectDialog(MessageBoxBase):
 
 class VideoSelectDialog(MessageBoxBase):
 
-    def __init__(self, files: list, parent=None):
+    def __init__(self, task, parent=None):
         super().__init__(parent)
-        self._files = files
+        self._files = task.files or []
 
         self.titleLabel = SubtitleLabel(self.tr("选择视频"), self)
         self.summaryLabel = BodyLabel("", self)
@@ -397,7 +287,7 @@ class VideoSelectDialog(MessageBoxBase):
         self.summaryLabel.setText(self.tr("{0}/{1} 个视频").format(count, self.treeModel.rowCount()))
         self.yesButton.setEnabled(count > 0)
 
-    def selectedIndices(self) -> set[int]:
+    def selectedIndexes(self) -> set[int]:
         return {
             self.treeModel.item(row, 0).data(Qt.ItemDataRole.UserRole)
             for row in range(self.treeModel.rowCount())
@@ -405,61 +295,151 @@ class VideoSelectDialog(MessageBoxBase):
         }
 
 
-class YtDlpTaskCard(UniversalTaskCard):
+class YtDlpDraftCard(DraftCard):
 
-    def __init__(self, task: YouTubeTask, parent=None):
-        super().__init__(task, parent)
-        self.selectFilesButton = None
-        if task.files and len(task.files) > 1:
-            self.selectFilesButton = ToolButton(FluentIcon.LIBRARY, self)
-            self.hBoxLayout.insertWidget(
-                self.hBoxLayout.indexOf(self.verifyHashButton),
-                self.selectFilesButton,
-            )
-            self.selectFilesButton.setToolTip(self.tr("选择视频"))
-            self.selectFilesButton.installEventFilter(ToolTipFilter(self.selectFilesButton))
-            self.selectFilesButton.clicked.connect(self._onSelectVideosClicked)
+    def _initWidget(self) -> None:
+        super()._initWidget()
+        task: YouTubeTask = self._task
+        mediaInfo: dict = getattr(task, "_mediaInfo", {})
+        hasMediaInfo = bool(mediaInfo.get("formats"))
 
-    def _onSelectVideosClicked(self) -> None:
-        from app.services.task_service import taskService
-        dialog = VideoSelectDialog(self._task.files, self.window())
+        self._qualityTiers = buildQualityTiers(mediaInfo) if hasMediaInfo else [("bv*+ba/b", self.tr("最佳画质"))]
+        self._subtitleChoices = buildSubtitleChoices(mediaInfo) if hasMediaInfo else []
+
+        self._mediaSpinner = IndeterminateProgressRing(self)
+        self._mediaSpinner.setFixedSize(20, 20)
+        self._mediaSpinner.setStrokeWidth(3)
+        self._mediaSpinner.setVisible(not hasMediaInfo)
+
+        self._qualityCombo = ComboBox(self)
+        self._qualityCombo.setMinimumWidth(160)
+        for _selector, label in self._qualityTiers:
+            self._qualityCombo.addItem(label)
+        if self._qualityTiers:
+            self._qualityCombo.setCurrentIndex(0)
+
+        self._subtitleButton = TransparentToolButton(FluentIcon.LANGUAGE, self)
+        self._subtitleButton.installEventFilter(ToolTipFilter(self._subtitleButton))
+        self._subtitleButton.setToolTip(self.tr("选择字幕"))
+        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
+
+        self._videoSelectButton = TransparentToolButton(FluentIcon.LIBRARY, self)
+        self._videoSelectButton.installEventFilter(ToolTipFilter(self._videoSelectButton))
+        self._videoSelectButton.setToolTip(self.tr("选择视频"))
+        self._videoSelectButton.setVisible(task.isPlaylist)
+
+        self._playlistSpinner = IndeterminateProgressRing(self)
+        self._playlistSpinner.setFixedSize(20, 20)
+        self._playlistSpinner.setStrokeWidth(3)
+        self._playlistSpinner.hide()
+
+        if not hasMediaInfo:
+            self._startMediaInfoFetch()
+
+    def _initLayout(self) -> None:
+        super()._initLayout()
+        self.layout().addWidget(self._mediaSpinner)
+        self.layout().addWidget(self._qualityCombo)
+        self.layout().addWidget(self._subtitleButton)
+        self.layout().addWidget(self._videoSelectButton)
+        self.layout().addWidget(self._playlistSpinner)
+
+    def _bind(self) -> None:
+        super()._bind()
+        self._qualityCombo.currentIndexChanged.connect(self._onQualityChanged)
+        self._subtitleButton.clicked.connect(self._onSubtitleClicked)
+        self._videoSelectButton.clicked.connect(self._onVideoSelectClicked)
+
+    def _startMediaInfoFetch(self) -> None:
+        from features.yt_dlp_pack.pack import YouTubeParser
+        parser = YouTubeParser()
+        self._coroutineRunner.submit(
+            parser.fetchFormats(self._task.url),
+            done=self._onMediaInfoLoaded,
+            failed=self._onMediaInfoFailed,
+            owner=self,
+        )
+
+    def _onMediaInfoLoaded(self, mediaInfo: dict) -> None:
+        self._mediaSpinner.hide()
+        if not mediaInfo:
+            return
+        task: YouTubeTask = self._task
+        task._mediaInfo = mediaInfo
+
         try:
-            if dialog.exec():
-                taskService.applySelection(self._task, dialog.selectedIndices())
-                self.refresh(force=True)
-        finally:
-            dialog.deleteLater()
+            fileSize = int(float(mediaInfo.get("filesize_approx") or 0))
+        except (TypeError, ValueError):
+            fileSize = 0
+        if fileSize:
+            task.fileSize = fileSize
+            self.sizeLabel.setText(toReadableSize(fileSize))
 
-    def _buildProgressBar(self) -> QWidget:
+        self._qualityTiers = buildQualityTiers(mediaInfo)
+        self._qualityCombo.clear()
+        for _selector, label in self._qualityTiers:
+            self._qualityCombo.addItem(label)
+        if self._qualityTiers:
+            self._qualityCombo.setCurrentIndex(0)
+
+        self._subtitleChoices = buildSubtitleChoices(mediaInfo)
+        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
+
+    def _onMediaInfoFailed(self, error: str) -> None:
+        self._mediaSpinner.hide()
+
+    def _onQualityChanged(self, index: int) -> None:
+        if 0 <= index < len(self._qualityTiers):
+            self._task.videoFormatFilter = self._qualityTiers[index][0]
+
+    def _onSubtitleClicked(self) -> None:
+        dialog = SubtitleSelectDialog(self._subtitleChoices, self.window())
+        if dialog.exec():
+            langs, includeAuto = dialog.selectedLanguages()
+            self._task.subtitleLanguages = langs
+            self._task.shouldIncludeAutoSubs = includeAuto
+
+    def _onVideoSelectClicked(self) -> None:
+        task: YouTubeTask = self._task
+        if not task.files:
+            self._videoSelectButton.hide()
+            self._playlistSpinner.show()
+            from features.yt_dlp_pack.pack import YouTubeParser
+            parser = YouTubeParser()
+            self._coroutineRunner.submit(
+                parser.fetchPlaylist(task.url),
+                done=self._onPlaylistLoaded,
+                failed=self._onPlaylistFailed,
+            )
+            return
+        dialog = VideoSelectDialog(task, self.window())
+        if dialog.exec():
+            task.setSelection(dialog.selectedIndexes())
+            self.nameLabel.setText(task.name)
+
+    def _onPlaylistLoaded(self, videos: list[dict]) -> None:
+        self._playlistSpinner.hide()
+        self._videoSelectButton.show()
+        task: YouTubeTask = self._task
+        if videos:
+            task.setVideos(videos)
+            self._onVideoSelectClicked()
+        else:
+            self._videoSelectButton.setEnabled(False)
+            self._videoSelectButton.setToolTip(self.tr("未找到播放列表"))
+
+    def _onPlaylistFailed(self, error: str) -> None:
+        self._playlistSpinner.hide()
+        self._videoSelectButton.show()
+        self._videoSelectButton.setToolTip(self.tr("加载播放列表失败"))
+
+
+class YtDlpTaskCard(MultiFileTaskCard):
+    fileSelectDialog = VideoSelectDialog
+    infoFields = [SPEED_FIELD, ETA_FIELD, YTDLP_SIZE_FIELD]
+    nameFormats = {TaskStatus.RUNNING: toYtDlpNameText}
+
+    def _createProgressBar(self) -> QWidget:
         bar = ProgressBar(self)
         bar.setCustomBackgroundColor(QColor(0, 0, 0, 0), QColor(0, 0, 0, 0))
         return bar
-
-    def refresh(self, force: bool = False) -> None:
-        super().refresh(force=force)
-        task: YouTubeTask = self._task
-        if task.status != TaskStatus.RUNNING:
-            if task.status == TaskStatus.COMPLETED and task.isPlaylist:
-                videoCount = len(task.steps) // STEPS_PER_VIDEO
-                receivedBytes = sum(s.receivedBytes for s in task.steps)
-                self.sizeLabel.setText(
-                    self.tr("{0} 个视频 · {1}").format(videoCount, toReadableSize(receivedBytes))
-                )
-                self.sizeLabel.show()
-            return
-
-        currentStep = next((s for s in task.steps if s.status == TaskStatus.RUNNING), None)
-        if not currentStep:
-            return
-
-        fileIndex = getattr(currentStep, "fileIndex", 0)
-        stepInGroup = currentStep.stepIndex - fileIndex * STEPS_PER_VIDEO
-        label = STEP_LABELS.get(stepInGroup, "")
-
-        if task.isPlaylist:
-            videoCount = len(task.steps) // STEPS_PER_VIDEO
-            videoStem = getattr(currentStep, "videoStem", "") or task.name
-            if label:
-                self.nameLabel.setText(f"{videoStem} ({fileIndex + 1}/{videoCount} · {label})")
-        elif label:
-            self.nameLabel.setText(f"{task.name} ({label})")

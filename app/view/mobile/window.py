@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from loguru import logger
 from PySide6.QtCore import QEvent, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QStackedWidget, QVBoxLayout, QWidget
@@ -12,7 +13,6 @@ from app.config.cfg import cfg
 from app.platform.android import clearShare, isStorageGranted, requestStoragePermission, sharedText, toTaskUrls
 from app.platform.android_notification import isNotificationEnabled, requestNotificationPermission
 from app.services.task_draft import TaskDraft
-from app.services.task_service import taskService
 from app.view.dialogs.task_draft import TaskDraftDialog
 from app.view.mobile.device import setupAccentColor
 from app.view.mobile.navigation import BottomNavigationBar
@@ -24,8 +24,14 @@ TASK_PAGE_INDEX = 0
 
 
 class MobileMainWindow(QWidget):
-    def __init__(self):
+    def __init__(self, taskService, featureService, browserService, categoryService, speedMeter, coroutineRunner):
         super().__init__(parent=None)
+        self._taskService = taskService
+        self._featureService = featureService
+        self._browserService = browserService
+        self._categoryService = categoryService
+        self._speedMeter = speedMeter
+        self._coroutineRunner = coroutineRunner
         setupAccentColor()
 
         self.stackedWidget = QStackedWidget(self)
@@ -36,15 +42,14 @@ class MobileMainWindow(QWidget):
             text=self.tr("未开启通知权限，下载完成后将无法提醒"),
             parent=self,
         )
-        self.taskPage = MobileTaskPage(self)
-        self.settingPage = MobileSettingPage(self)
+        self.taskPage = MobileTaskPage(taskService, featureService, categoryService, speedMeter, parent=self)
+        self.settingPage = MobileSettingPage(featureService, browserService, coroutineRunner, categoryService, parent=self)
         self.searchEdit = SearchLineEdit(self)
         self.addButton = PrimaryToolButton(FluentIcon.ADD, self)
         self.vBoxLayout = QVBoxLayout(self)
 
-        self._draft = TaskDraft(parent=self)
-        self._draftDialog = TaskDraftDialog(self._draft, parent=self)
-        self._shareDraft = TaskDraft(parent=self)
+        self._draft = TaskDraft(coroutineRunner, featureService, parent=self)
+        self._draftDialog = TaskDraftDialog(self._draft, featureService, categoryService, parent=self)
 
         self._initWidget()
         self._initLayout()
@@ -88,8 +93,7 @@ class MobileMainWindow(QWidget):
         self.searchEdit.textChanged.connect(self._onSearchTextChanged)
         self.taskPage.selectionModeChanged.connect(lambda *_: self._updateAddButtonVisibility())
         self.addButton.clicked.connect(self._showAddTaskDialog)
-        self._draft.taskConfirmed.connect(taskService.add)
-        self._shareDraft.taskConfirmed.connect(taskService.add)
+        self._draft.taskConfirmed.connect(self._taskService.add)
         QApplication.instance().applicationStateChanged.connect(self._onApplicationStateChanged)
         cfg.themeChanged.connect(self._setTheme)
         QApplication.instance().styleHints().colorSchemeChanged.connect(self._onSystemColorSchemeChanged)
@@ -101,12 +105,12 @@ class MobileMainWindow(QWidget):
 
     def _onSearchTextChanged(self, text: str) -> None:
         page = self.stackedWidget.currentWidget()
-        if hasattr(page, 'setSearchText'):
+        if isinstance(page, MobileTaskPage):
             page.setSearchText(text)
 
     def _updateSearchTarget(self, page: QWidget) -> None:
         self.searchEdit.clear()
-        if hasattr(page, 'setSearchText'):
+        if isinstance(page, MobileTaskPage):
             self.searchEdit.setPlaceholderText(page.searchPlaceholder)
             self.searchEdit.show()
         else:
@@ -154,8 +158,20 @@ class MobileMainWindow(QWidget):
             self._draftDialog.showMask()
             return
         self.navigationBar.setCurrentIndex(TASK_PAGE_INDEX)
-        self._shareDraft.setUrls(urls)
-        self._shareDraft.confirm()
+        self._autoAddUrls(urls)
+
+    def _autoAddUrls(self, urls: list[str]) -> None:
+        from app.models.task import TaskOptions
+
+        async def parseAndAdd():
+            for url in urls:
+                try:
+                    task = await self._featureService.parse(TaskOptions(url=url))
+                    self._taskService.add(task)
+                except Exception as e:
+                    logger.warning("自动下载失败 {}: {}", url, e)
+
+        self._coroutineRunner.submit(parseAndAdd())
 
     def _updatePermissionBanner(self):
         self.permissionBanner.setVisible(not isStorageGranted())

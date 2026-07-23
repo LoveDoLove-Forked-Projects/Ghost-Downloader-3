@@ -6,125 +6,16 @@ from PySide6.QtWidgets import QAbstractItemView, QHBoxLayout, QHeaderView
 from qfluentwidgets import (
     BodyLabel, ComboBox, FluentIcon, MessageBoxBase,
     PrimaryPushButton, PushButton, SubtitleLabel,
-    ToolButton, ToolTipFilter, TransparentToolButton,
+    ToolTipFilter, TransparentToolButton,
 )
 
 from app.format import toReadableSize
-from app.view.cards.draft_cards import UniversalDraftCard
-from app.view.cards.task_cards import UniversalTaskCard
+from app.view.cards.draft_cards import MultiFileDraftCard
+from app.view.cards.task_cards import MultiFileTaskCard
 from app.view.components.tree_view import AutoSizingTreeView
 from .task import BilibiliTask, DownloadMode
 
 MODE_LABELS = ("视频", "音频", "封面")
-
-
-class BilibiliDraftCard(UniversalDraftCard):
-
-    def _initWidget(self) -> None:
-        super()._initWidget()
-        self._modeCombo = ComboBox(self)
-        self._modeCombo.setMinimumWidth(80)
-        for label in MODE_LABELS:
-            self._modeCombo.addItem(self.tr(label))
-        self._modeCombo.setCurrentIndex(self.task.mode.value)
-
-        self._subtitleChoices = self._buildSubtitleChoices()
-
-        self._subtitleButton = TransparentToolButton(FluentIcon.LANGUAGE, self)
-        self._subtitleButton.installEventFilter(ToolTipFilter(self._subtitleButton))
-        self._subtitleButton.setToolTip(self.tr("选择字幕"))
-        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
-
-        self._selectPagesButton = TransparentToolButton(FluentIcon.LIBRARY, self)
-        self._selectPagesButton.installEventFilter(ToolTipFilter(self._selectPagesButton))
-        self._selectPagesButton.setToolTip(self.tr("选择分P"))
-        self._refreshButtonVisibility()
-
-    def _initLayout(self) -> None:
-        super()._initLayout()
-        self.layout().addWidget(self._modeCombo)
-        self.layout().addWidget(self._subtitleButton)
-        self.layout().addWidget(self._selectPagesButton)
-
-    def _bind(self) -> None:
-        super()._bind()
-        self._modeCombo.currentIndexChanged.connect(self._onModeChanged)
-        self._subtitleButton.clicked.connect(self._onSubtitleClicked)
-        self._selectPagesButton.clicked.connect(self._onSelectPagesClicked)
-
-    def _onModeChanged(self, index: int) -> None:
-        task: BilibiliTask = self._task
-        task.setMode(DownloadMode(index))
-        self._refreshSummary()
-
-    def _onSubtitleClicked(self) -> None:
-        task: BilibiliTask = self._task
-        dialog = SubtitleSelectDialog(self._subtitleChoices, task.subtitleLanguages, self.window())
-        if dialog.exec():
-            task.setSubtitleLanguages(dialog.selectedLanguages())
-
-    def _onSelectPagesClicked(self) -> None:
-        task: BilibiliTask = self._task
-        dialog = PageSelectDialog(task, self.window())
-        if dialog.exec():
-            selected = dialog.selectedPageNumbers()
-            if selected:
-                task.setSelection({n - 1 for n in selected})
-                self._refreshSummary()
-
-    def _refreshSummary(self) -> None:
-        self.sizeLabel.setText(toReadableSize(self._task.fileSize))
-        self.nameLabel.setText(self._task.name)
-        self._refreshButtonVisibility()
-
-    def _buildSubtitleChoices(self) -> list[tuple[str, str]]:
-        seen: set[str] = set()
-        choices: list[tuple[str, str]] = []
-        for page in self.task.files or []:
-            for sub in page.subtitles:
-                lan = sub.get("lan", "")
-                if lan and lan not in seen:
-                    seen.add(lan)
-                    label = sub.get("lan_doc", lan)
-                    if sub.get("isAi"):
-                        label += "（自动生成）"
-                    choices.append((lan, label))
-        return choices
-
-    def _refreshButtonVisibility(self) -> None:
-        task: BilibiliTask = self._task
-        isCover = task.mode == DownloadMode.COVER
-        self._selectPagesButton.setVisible(not isCover and len(task.files or []) > 1)
-        self._subtitleButton.setVisible(not isCover)
-        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
-
-
-
-class BilibiliTaskCard(UniversalTaskCard):
-    def __init__(self, task: BilibiliTask, parent=None):
-        super().__init__(task, parent)
-        self.selectFilesButton = None
-        if task.mode != DownloadMode.COVER and task.files and len(task.files) > 1:
-            self.selectFilesButton = ToolButton(FluentIcon.LIBRARY, self)
-            self.hBoxLayout.insertWidget(
-                self.hBoxLayout.indexOf(self.verifyHashButton),
-                self.selectFilesButton,
-            )
-            self.selectFilesButton.setToolTip(self.tr("选择分P"))
-            self.selectFilesButton.installEventFilter(ToolTipFilter(self.selectFilesButton))
-            self.selectFilesButton.clicked.connect(self._onSelectPagesClicked)
-
-    def _onSelectPagesClicked(self) -> None:
-        from app.services.task_service import taskService
-        dialog = PageSelectDialog(self._task, self.window())
-        try:
-            if dialog.exec():
-                selected = dialog.selectedPageNumbers()
-                if selected:
-                    taskService.applySelection(self._task, {n - 1 for n in selected})
-                    self.refresh(force=True)
-        finally:
-            dialog.deleteLater()
 
 
 class SubtitleSelectDialog(MessageBoxBase):
@@ -308,3 +199,97 @@ class PageSelectDialog(MessageBoxBase):
             for row in range(self.treeModel.rowCount())
             if self.treeModel.item(row, 0).checkState() == Qt.CheckState.Checked
         }
+
+    def selectedIndexes(self) -> set[int]:
+        return {n - 1 for n in self.selectedPageNumbers()}
+
+
+class BilibiliDraftCard(MultiFileDraftCard):
+
+    def _initWidget(self) -> None:
+        super()._initWidget()
+        self._modeCombo = ComboBox(self)
+        self._modeCombo.setMinimumWidth(80)
+        for label in MODE_LABELS:
+            self._modeCombo.addItem(self.tr(label))
+        self._modeCombo.setCurrentIndex(self.task.mode.value)
+
+        self._subtitleChoices = self._buildSubtitleChoices()
+
+        self._subtitleButton = TransparentToolButton(FluentIcon.LANGUAGE, self)
+        self._subtitleButton.installEventFilter(ToolTipFilter(self._subtitleButton))
+        self._subtitleButton.setToolTip(self.tr("选择字幕"))
+        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
+
+        if self._selectFilesButton is not None:
+            self._selectFilesButton.setToolTip(self.tr("选择分P"))
+        self._refreshButtonVisibility()
+
+    def _initLayout(self) -> None:
+        super()._initLayout()
+        self.layout().addWidget(self._modeCombo)
+        self.layout().addWidget(self._subtitleButton)
+
+    def _bind(self) -> None:
+        super()._bind()
+        self._modeCombo.currentIndexChanged.connect(self._onModeChanged)
+        self._subtitleButton.clicked.connect(self._onSubtitleClicked)
+
+    def _onModeChanged(self, index: int) -> None:
+        task: BilibiliTask = self._task
+        task.setMode(DownloadMode(index))
+        self._refreshSummary()
+
+    def _onSelectFilesClicked(self) -> None:
+        task: BilibiliTask = self._task
+        dialog = PageSelectDialog(task, self.window())
+        if dialog.exec():
+            selected = dialog.selectedPageNumbers()
+            if selected:
+                task.setSelection({n - 1 for n in selected})
+                self._refreshSummary()
+
+    def _onSubtitleClicked(self) -> None:
+        task: BilibiliTask = self._task
+        dialog = SubtitleSelectDialog(self._subtitleChoices, task.subtitleLanguages, self.window())
+        if dialog.exec():
+            task.setSubtitleLanguages(dialog.selectedLanguages())
+
+    def _refreshSummary(self) -> None:
+        self.sizeLabel.setText(toReadableSize(self._task.fileSize))
+        self.nameLabel.setText(self._task.name)
+        self._refreshButtonVisibility()
+
+    def _buildSubtitleChoices(self) -> list[tuple[str, str]]:
+        seen: set[str] = set()
+        choices: list[tuple[str, str]] = []
+        for page in self.task.files or []:
+            for sub in page.subtitles:
+                lan = sub.get("lan", "")
+                if lan and lan not in seen:
+                    seen.add(lan)
+                    label = sub.get("lan_doc", lan)
+                    if sub.get("isAi"):
+                        label += "（自动生成）"
+                    choices.append((lan, label))
+        return choices
+
+    def _refreshButtonVisibility(self) -> None:
+        task: BilibiliTask = self._task
+        isCover = task.mode == DownloadMode.COVER
+        if self._selectFilesButton is not None:
+            self._selectFilesButton.setVisible(not isCover and len(task.files or []) > 1)
+        self._subtitleButton.setVisible(not isCover)
+        self._subtitleButton.setEnabled(bool(self._subtitleChoices))
+
+
+class BilibiliTaskCard(MultiFileTaskCard):
+    fileSelectDialog = PageSelectDialog
+
+    def _initWidget(self) -> None:
+        super()._initWidget()
+        task: BilibiliTask = self._task
+        if task.mode == DownloadMode.COVER:
+            self.selectFilesButton.hide()
+        self.selectFilesButton.setToolTip(self.tr("选择分P"))
+        self.selectFilesButton.installEventFilter(ToolTipFilter(self.selectFilesButton))

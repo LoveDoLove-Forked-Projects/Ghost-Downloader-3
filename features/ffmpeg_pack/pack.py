@@ -22,10 +22,8 @@ class MergeParser(TaskParser):
         if not ffmpegRuntime.path() or not ffmpegRuntime.ffprobePath():
             raise RuntimeError("未找到可用的 ffmpeg 和 ffprobe，请先在设置中安装或配置 FFmpeg")
 
-        from app.services.feature_service import featureService
-
-        videoTask = await featureService.parse(options.video)
-        audioTask = await featureService.parse(options.audio)
+        videoTask = await self.delegate(options.video)
+        audioTask = await self.delegate(options.audio)
 
         videoStep = videoTask.steps[0]
         audioStep = audioTask.steps[0]
@@ -74,9 +72,7 @@ class MergeParser(TaskParser):
 class FFmpegPack(FeaturePack):
     packId = "ffmpeg"
     config = ffmpegConfig
+    parsers = [MergeParser]
 
     def runtimes(self):
         return [ffmpegRuntime]
-
-    def parsers(self):
-        return [MergeParser()]

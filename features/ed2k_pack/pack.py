@@ -31,16 +31,17 @@ class ED2kParser(TaskParser):
 class ED2kPack(FeaturePack):
     packId = "ed2k"
     config = ed2kConfig
+    parsers = [ED2kParser]
 
     def runtimes(self):
         return [ed2kRuntime]
 
-    def parsers(self):
-        return [ED2kParser()]
+    async def activate(self):
+        from .session import ed2kSession
+        ed2kSession.submit = self.submit
 
-    def stop(self):
+    async def deactivate(self):
         from .session import ed2kSession
         if ed2kSession._client is None:
             return
-        from app.services.coroutine_runner import coroutineRunner
-        coroutineRunner.submit(ed2kSession.close())
+        await ed2kSession.close()

@@ -15,6 +15,7 @@ from app.config.cfg import cfg
 from app.models.pack import FeaturePack, TaskParser, FileType
 from app.models.task import Task, TaskOptions
 from app.platform.filesystem import localFilePath, toSafeFilename
+from .cards import M3U8DraftCard, M3U8TaskCard
 from .config import m3u8Config, m3u8Runtime
 from .task import M3U8Task, M3U8TaskStep
 
@@ -243,25 +244,22 @@ class M3U8Parser(TaskParser):
 
 class M3U8Pack(FeaturePack):
     packId = "m3u8"
+    parsers = [M3U8Parser]
+    taskCards = {M3U8Task: M3U8TaskCard}
+    draftCards = {M3U8Task: M3U8DraftCard}
 
-    def __init__(self):
+    def taskCardClass(self, task):
+        if getattr(task, "isLive", False):
+            from .cards import M3U8LiveTaskCard
+            return M3U8LiveTaskCard
+        return super().taskCardClass(task)
+
+    def __init__(self, services):
         self.config = m3u8Config
+        super().__init__(services)
 
     def runtimes(self):
         return [m3u8Runtime]
-
-    def parsers(self):
-        return [M3U8Parser()]
-
-    def taskCard(self, task, parent=None):
-        from .cards import M3U8TaskCard, M3U8LiveTaskCard
-        if getattr(task, "isLive", False):
-            return M3U8LiveTaskCard(task, parent)
-        return M3U8TaskCard(task, parent)
-
-    def draftCard(self, task, parent=None):
-        from .cards import M3U8DraftCard
-        return M3U8DraftCard(task, parent)
 
     def optionCards(self, task, parent=None):
         from app.view.components.option_cards import HeadersEditCard, OutputFolderCard

@@ -27,12 +27,10 @@ class InstallParser(TaskParser):
         return isinstance(options, BinaryInstallOptions)
 
     async def parse(self, options: BinaryInstallOptions) -> Task:
-        from app.services.feature_service import featureService
-
         installFolder = options.outputFolder
         assetName = assetNameFromUrl(options.url)
 
-        download = await featureService.parse(
+        download = await self.delegate(
             TaskOptions(url=options.url, outputFolder=installFolder)
         )
         downloadStep = download.steps[0]
@@ -59,7 +57,7 @@ class InstallParser(TaskParser):
         stepIndex += 1
 
         if options.sha256Url:
-            checksumDownload = await featureService.parse(
+            checksumDownload = await self.delegate(
                 TaskOptions(url=options.sha256Url, outputFolder=installFolder)
             )
             checksumStep = checksumDownload.steps[0]
@@ -97,6 +95,4 @@ class InstallParser(TaskParser):
 
 class DiskPack(FeaturePack):
     packId = "disk"
-
-    def parsers(self):
-        return [InstallParser()]
+    parsers = [InstallParser]

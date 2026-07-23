@@ -9,7 +9,10 @@ from PySide6.QtCore import QCoreApplication, Signal
 from app.config.cfg import cfg, ConfigItem
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from app.models.task import Task, TaskOptions
+    from app.services.coroutine_runner import CoroutineRunner
+    from app.services.speed_meter import SpeedMeter
     from PySide6.QtWidgets import QWidget
     from qfluentwidgets import FluentIcon
     from app.view.components.setting_card_group import CollapsibleSettingCardGroup
@@ -25,6 +28,8 @@ class FileType:
 
 class TaskParser:
     priority: int = 100
+    pack: FeaturePack | None = None
+    delegate: Callable[[TaskOptions], Awaitable[Task]] | None = None
 
     def match(self, options: TaskOptions) -> bool:
         raise NotImplementedError
@@ -37,6 +42,9 @@ class TaskParser:
 
 
 class PackConfig:
+    createRuntimeCard: Callable[..., QWidget] | None = None
+    submit: Callable[..., str] | None = None
+    associateFileTypes: ConfigItem | None = None
     _items: dict[str, ConfigItem] = {}
 
     def __init_subclass__(cls, **kwargs):
@@ -79,6 +87,7 @@ class PackConfig:
 
 
 class BinaryRuntime:
+    parse: Callable[[TaskOptions], Awaitable[Task]] | None = None
     name: str = ""
     canInstall: bool = False
     # 自描述展示信息（title 用 QT_TRANSLATE_NOOP 声明原文，展示端 translate）
@@ -120,21 +129,32 @@ class PackPage:
     title: str = ""
 
 
+@dataclass(frozen=True)
+class PackServices:
+    coroutineRunner: CoroutineRunner
+    speedMeter: SpeedMeter
+
+
 class FeaturePack:
     packId: str = ""
     config: PackConfig | None = None
     proxySchemes: set[str] | None = None
 
-    def parsers(self) -> list[TaskParser]:
-        return []
+    parsers: list[type[TaskParser]] = []
+    taskCards: dict = {}
+    draftCards: dict = {}
+    parse: Callable[[TaskOptions], Awaitable[Task]] | None = None
+    addTask: Callable[[Task], None] | None = None
+    submit: Callable[..., str] | None = None
 
-    def taskCard(self, task: Task, parent=None):
-        from app.view.cards.task_cards import UniversalTaskCard
-        return UniversalTaskCard(task, parent)
+    def __init__(self, services: PackServices):
+        self._services = services
 
-    def draftCard(self, task: Task, parent=None):
-        from app.view.cards.draft_cards import UniversalDraftCard
-        return UniversalDraftCard(task, parent)
+    def taskCardClass(self, task: Task):
+        return self.taskCards.get(type(task))
+
+    def draftCardClass(self, task: Task):
+        return self.draftCards.get(type(task))
 
     def optionCards(self, task: Task, parent=None) -> list[QWidget]:
         return []
@@ -151,10 +171,10 @@ class FeaturePack:
     def pages(self) -> list[type[PackPage]]:
         return []
 
-    def start(self):
+    async def activate(self):
         pass
 
-    def stop(self):
+    async def deactivate(self):
         pass
 
     def tr(self, text: str) -> str:

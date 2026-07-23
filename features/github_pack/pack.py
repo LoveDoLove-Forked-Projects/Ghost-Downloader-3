@@ -2,6 +2,8 @@ from urllib.parse import urlparse
 
 from app.models.pack import FeaturePack, TaskParser
 from app.models.task import Task, TaskOptions
+from http_pack.cards import HttpTaskCard
+from http_pack.task import HttpTask
 from .config import githubConfig, selectedProxySite
 
 GITHUB_HOSTS = {
@@ -53,10 +55,9 @@ class GitHubParser(TaskParser):
 
     async def parse(self, options: TaskOptions) -> Task:
         from dataclasses import replace
-        from app.services.feature_service import featureService
 
         proxiedUrl = f"{selectedProxySite().rstrip('/')}/{options.url.lstrip('/')}"
-        task = await featureService.parse(replace(options, url=proxiedUrl))
+        task = await self.delegate(replace(options, url=proxiedUrl))
         task.url = options.url
         task.packId = "github"
         return task
@@ -65,9 +66,8 @@ class GitHubParser(TaskParser):
 class GitHubPack(FeaturePack):
     packId = "github"
     config = githubConfig
-
-    def parsers(self):
-        return [GitHubParser()]
+    parsers = [GitHubParser]
+    taskCards = {HttpTask: HttpTaskCard}
 
     def optionCards(self, task, parent=None):
         from http_pack.pack import HttpPack
@@ -76,7 +76,3 @@ class GitHubPack(FeaturePack):
     def editCards(self, task, parent=None):
         from http_pack.pack import HttpPack
         return HttpPack.editCards(self, task, parent)
-
-    def taskCard(self, task, parent=None):
-        from http_pack.cards import HttpTaskCard
-        return HttpTaskCard(task, parent)

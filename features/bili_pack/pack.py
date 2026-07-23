@@ -11,7 +11,8 @@ from app.config.cfg import cfg
 from app.models.pack import FeaturePack, TaskParser
 from app.models.task import TaskOptions
 from app.platform.filesystem import toSafeFilename
-from .account import bilibiliAccount
+from .account import BilibiliAccount
+from .cards import BilibiliDraftCard, BilibiliTaskCard
 from .config import bilibiliConfig
 from .task import BiliPage, BilibiliTask
 
@@ -35,7 +36,7 @@ class BilibiliParser(TaskParser):
         subworkerCount = options.subworkerCount
         outputFolder = options.outputFolder
 
-        await bilibiliAccount.fetchWbiKeys()
+        await self.pack.account.fetchWbiKeys()
 
         parsed = urlparse(url)
         referer = parsed._replace(netloc="www.bilibili.com").geturl() if (
@@ -43,7 +44,7 @@ class BilibiliParser(TaskParser):
         ) else url
 
         apiHeaders = {}
-        cookie = bilibiliAccount.cookie
+        cookie = self.pack.account.cookie
         if cookie:
             apiHeaders["cookie"] = cookie
 
@@ -131,7 +132,7 @@ class BilibiliParser(TaskParser):
                     playParams["avid"] = videoId[2:]
                 else:
                     playParams["bvid"] = videoId
-                playParams = bilibiliAccount.signParams(playParams)
+                playParams = self.pack.account.signParams(playParams)
                 playApiUrl = f"https://api.bilibili.com/x/player/wbi/playurl?{urllib.parse.urlencode(playParams)}"
 
                 response = await client.get(playApiUrl)
@@ -284,21 +285,18 @@ class BilibiliParser(TaskParser):
 class BilibiliPack(FeaturePack):
     packId = "bili"
     config = bilibiliConfig
+    parsers = [BilibiliParser]
+    taskCards = {BilibiliTask: BilibiliTaskCard}
+    draftCards = {BilibiliTask: BilibiliDraftCard}
 
-    def parsers(self):
-        return [BilibiliParser()]
-
-    def draftCard(self, task, parent=None):
-        from .cards import BilibiliDraftCard
-        return BilibiliDraftCard(task, parent)
-
-    def taskCard(self, task, parent=None):
-        from .cards import BilibiliTaskCard
-        return BilibiliTaskCard(task, parent)
+    def __init__(self, services):
+        super().__init__(services)
+        self.account = BilibiliAccount(services.coroutineRunner)
+        self.config._account = self.account
 
     def optionCards(self, task, parent=None):
         from app.view.components.option_cards import OutputFolderCard
         return [OutputFolderCard(parent, initial=task.outputFolder)]
 
-    def start(self):
-        bilibiliAccount.fetchAccountInfo()
+    async def activate(self):
+        self.account.fetchAccountInfo()

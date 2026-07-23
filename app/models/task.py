@@ -114,6 +114,7 @@ class TaskStep:
         TaskStep._registry[cls.__name__] = cls
 
     stepIndex: int
+    fileIndex: int | None = None
     stepId: str = field(default_factory=lambda: f"stp_{uuid4().hex}")
     status: TaskStatus = TaskStatus.WAITING
     progress: float = 0
@@ -128,7 +129,7 @@ class TaskStep:
     def task(self) -> Task:
         return self._task
 
-    def setStatus(self, status: TaskStatus, sync: bool = True):
+    def setStatus(self, status: TaskStatus):
         self.status = status
         if status == TaskStatus.COMPLETED:
             self.progress = 100
@@ -140,7 +141,7 @@ class TaskStep:
         elif status == TaskStatus.FAILED:
             self.speed = 0
 
-        if sync and hasattr(self, "_task"):
+        if hasattr(self, "_task"):
             self._task.updateStatus()
 
     def setError(self, error: StepError) -> None:
@@ -150,19 +151,19 @@ class TaskStep:
         if hasattr(self, "_task"):
             self._task.updateStatus()
 
-    def reset(self, sync: bool = True):
+    def reset(self):
         self.status = TaskStatus.WAITING
         self.progress = 0
         self.receivedBytes = 0
         self.speed = 0
         self.error = None
-        if sync and hasattr(self, "_task"):
+        if hasattr(self, "_task"):
             self._task.updateStatus()
 
     def setOptions(self, options: dict) -> None:
         pass
 
-    async def run(self) -> None:
+    async def run(self, reportSpeed, waitForSpeedLimit) -> None:
         raise NotImplementedError
 
     @property
@@ -284,7 +285,7 @@ class Task:
     def _isStepSelected(self, step: TaskStep) -> bool:
         if not self.files:
             return True
-        fileIndex = getattr(step, "fileIndex", None)
+        fileIndex = step.fileIndex
         if fileIndex is None:
             return True
         for file in self.files:
@@ -298,7 +299,7 @@ class Task:
         received: dict[int, int] = {}
         completed: dict[int, bool] = {}
         for step in self.steps:
-            fileIndex = getattr(step, "fileIndex", None)
+            fileIndex = step.fileIndex
             if fileIndex is None:
                 continue
             received[fileIndex] = received.get(fileIndex, 0) + step.receivedBytes
@@ -354,8 +355,18 @@ class Task:
             if step.status == TaskStatus.COMPLETED:
                 continue
             if status == TaskStatus.RUNNING and step.status == TaskStatus.FAILED:
-                step.reset(sync=False)
-            step.setStatus(status, sync=False)
+                step.status = TaskStatus.WAITING
+                step.progress = 0
+                step.receivedBytes = 0
+                step.speed = 0
+                step.error = None
+            step.status = status
+            step.speed = 0
+            if status == TaskStatus.COMPLETED:
+                step.progress = 100
+                step.error = None
+            elif status in {TaskStatus.WAITING, TaskStatus.PAUSED}:
+                step.error = None
         return self.updateStatus()
 
     def reset(self) -> TaskStatus:
@@ -364,7 +375,11 @@ class Task:
             self.status = TaskStatus.WAITING
             return self.status
         for step in self.steps:
-            step.reset(sync=False)
+            step.status = TaskStatus.WAITING
+            step.progress = 0
+            step.receivedBytes = 0
+            step.speed = 0
+            step.error = None
         return self.updateStatus()
 
     def addStep(self, step: TaskStep):
@@ -386,8 +401,7 @@ class Task:
         self.updateStatus()
 
     def pendingSteps(self) -> Iterable[TaskStep]:
-        self.steps.sort(key=lambda step: step.stepIndex)
-        for step in self.steps:
+        for step in sorted(self.steps, key=lambda step: step.stepIndex):
             if self.status != TaskStatus.RUNNING:
                 break
             if not self._isStepSelected(step):
@@ -423,12 +437,12 @@ class Task:
             step._bindTask(self)
         self.updateStatus()
 
-    async def run(self):
+    async def run(self, reportSpeed, waitForSpeedLimit):
         currentStep = None
         try:
             for step in self.pendingSteps():
                 currentStep = step
-                await step.run()
+                await step.run(reportSpeed, waitForSpeedLimit)
         except asyncio.CancelledError:
             logger.info("{} stopped", self.name)
             raise
