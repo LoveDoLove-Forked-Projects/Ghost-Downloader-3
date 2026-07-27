@@ -11,16 +11,16 @@ from PySide6.QtWidgets import (
     QSpacerItem, QSizePolicy, QFileDialog,
 )
 from qfluentwidgets import (
-    SettingCard, PushSettingCard, RangeConfigItem, SpinBox, DoubleSpinBox,
+    SettingCard, RangeConfigItem, SpinBox, DoubleSpinBox,
     ConfigItem, FluentIcon, BodyLabel, CaptionLabel,
     RadioButton, ComboBox, LineEdit, ToolButton, ToolTipFilter,
     PrimaryPushButton, InfoBar, InfoBarPosition,
-    IconWidget, TransparentToolButton,
+    IconWidget,
 )
 
 from app.view.components.setting_card_group import CollapsibleSettingCard
 
-from app.config.cfg import cfg, proxy, BASE_HEADERS
+from app.config.cfg import cfg, proxy, currentHeaders, currentHeadersPresetIndex
 from app.view.components.banners import WarningBanner
 
 HOST_PATTERN = compile(
@@ -434,7 +434,7 @@ class PresetRowWidget(QWidget):
         textLayout.addLayout(self.descLayout)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(48, 8, 24, 8)
+        layout.setContentsMargins(48, 12, 24, 12)
         layout.setSpacing(12)
         layout.addWidget(self.iconWidget)
         layout.addLayout(textLayout, 1)
@@ -589,47 +589,175 @@ class IdentitySettingCard(CollapsibleSettingCard):
         cfg.set(cfg.identityPresets, presets)
 
     def _onRemoveClicked(self, index: int) -> None:
+        from qfluentwidgets import MessageBox
         presets = list(cfg.identityPresets.value)
         if index < 0 or index >= len(presets):
             return
+        name = presets[index].get("name", self.tr("未命名预设"))
+        dialog = MessageBox(
+            self.tr("删除预设"),
+            self.tr("确定要删除 {0} 吗？").format(name),
+            self.window(),
+        )
+        if not dialog.exec():
+            return
+        row = self._rowWidgets.pop(index)
+        self.viewLayout.removeWidget(row)
+        row.deleteLater()
+        for i in range(index, len(self._rowWidgets)):
+            self._rowWidgets[i]._index = i
         presets.pop(index)
         cfg.set(cfg.identityPresets, presets)
+        self._refreshChoiceLabel()
+
+
+class HeadersPresetRow(QWidget):
+
+    def __init__(self, index: int, preset: dict, parent=None, *,
+                 isCurrent: bool, canRemove: bool, onPick, onEdit, onRemove):
+        from qfluentwidgets import PrimaryToolButton
+        super().__init__(parent)
+        self._index = index
+        self._onPick = onPick
+        self._onEdit = onEdit
+        self._onRemove = onRemove
+
+        self.radioButton = RadioButton(preset["name"], self)
+        self.countLabel = CaptionLabel(
+            self.tr("{0} 条标头").format(len(preset["headers"])), self)
+        self.editButton = PrimaryToolButton(FluentIcon.EDIT, self)
+        self.removeButton = ToolButton(FluentIcon.DELETE, self)
+
+        self._initWidget(isCurrent, canRemove)
+        self._initLayout()
+        self._bind()
+
+    def _initWidget(self, isCurrent: bool, canRemove: bool) -> None:
+        self.radioButton.setChecked(isCurrent)
+        self.editButton.setToolTip(self.tr("编辑"))
+        self.editButton.installEventFilter(ToolTipFilter(self.editButton))
+        self.removeButton.setToolTip(self.tr("删除"))
+        self.removeButton.installEventFilter(ToolTipFilter(self.removeButton))
+        self.removeButton.setEnabled(canRemove)
+
+    def _initLayout(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(48, 12, 24, 12)
+        layout.setSpacing(12)
+        layout.addWidget(self.radioButton)
+        layout.addStretch(1)
+        layout.addWidget(self.countLabel)
+        layout.addWidget(self.editButton)
+        layout.addWidget(self.removeButton)
+
+    def _bind(self) -> None:
+        self.radioButton.clicked.connect(lambda: self._onPick(self._index))
+        self.editButton.clicked.connect(lambda: self._onEdit(self._index))
+        self.removeButton.clicked.connect(lambda: self._onRemove(self._index))
+
+
+class HeadersPresetSettingCard(CollapsibleSettingCard):
+
+    def __init__(self, parent=None):
+        super().__init__(FluentIcon.DICTIONARY, self.tr("请求标头预设"),
+                         self.tr("新建任务的标头起点"), parent=parent)
+        self._rowWidgets: list[HeadersPresetRow] = []
+
+        self.choiceLabel = BodyLabel(self)
+        self.buttonContainer = QWidget(self.view)
+        self.buttonLayout = QHBoxLayout(self.buttonContainer)
+        self.addButton = PrimaryPushButton(
+            FluentIcon.ADD, self.tr("添加预设"), self.buttonContainer)
+
+        self._initLayout()
+        self._bind()
         self._reload()
 
+    def _initLayout(self) -> None:
+        self.addWidget(self.choiceLabel)
 
-class DefaultHeadersSettingCard(PushSettingCard):
-    def __init__(self, icon, title: str, content: str = "", parent=None):
-        super().__init__(self.tr("编辑"), icon, title, content, parent)
-        self.clicked.connect(self._onClicked)
+        self.buttonLayout.setContentsMargins(48, 8, 24, 8)
+        self.buttonLayout.addStretch(1)
+        self.buttonLayout.addWidget(self.addButton)
 
-    def _onClicked(self) -> None:
-        from qfluentwidgets import MessageBoxBase, SubtitleLabel, TransparentToolButton
-        from app.view.components.editors import HeadersEditor
+        self.viewLayout.setSpacing(0)
+        self.viewLayout.setContentsMargins(0, 0, 0, 0)
 
-        dialog = MessageBoxBase(self.window())
-        dialog.widget.setMinimumWidth(500)
+    def _bind(self) -> None:
+        self.addButton.clicked.connect(self._onAddClicked)
 
-        titleRow = QHBoxLayout()
-        titleRow.addWidget(SubtitleLabel(self.tr("编辑默认请求头"), dialog))
-        titleRow.addStretch(1)
-        resetButton = TransparentToolButton(FluentIcon.HISTORY, dialog)
-        resetButton.setToolTip(self.tr("恢复默认"))
-        resetButton.installEventFilter(ToolTipFilter(resetButton))
-        titleRow.addWidget(resetButton)
-        dialog.viewLayout.addLayout(titleRow)
+    def _reload(self) -> None:
+        for row in self._rowWidgets:
+            self.viewLayout.removeWidget(row)
+            row.deleteLater()
+        self._rowWidgets.clear()
+        self.viewLayout.removeWidget(self.buttonContainer)
 
-        editor = HeadersEditor(dialog)
-        editor.setHeaders(dict(cfg.defaultRequestHeaders.value))
-        dialog.viewLayout.addWidget(editor)
+        presets = cfg.headersPresets.value
+        current = currentHeadersPresetIndex()
+        for i, preset in enumerate(presets):
+            row = HeadersPresetRow(
+                i, preset, self.view,
+                isCurrent=i == current, canRemove=len(presets) > 1,
+                onPick=self._onPick, onEdit=self._onEditClicked,
+                onRemove=self._onRemoveClicked,
+            )
+            self.viewLayout.addWidget(row)
+            self._rowWidgets.append(row)
 
-        resetButton.clicked.connect(
-            lambda: editor.setHeaders(dict(BASE_HEADERS))
-        )
+        self.viewLayout.addWidget(self.buttonContainer)
+        self.choiceLabel.setText(presets[current]["name"])
 
+    def _onPick(self, index: int) -> None:
+        cfg.set(cfg.currentHeadersPreset, index)
+        self._reload()
+
+    def _onAddClicked(self) -> None:
+        from app.view.dialogs.headers_preset_edit import HeadersPresetEditDialog
+        dialog = HeadersPresetEditDialog(
+            self.window(), preset={"name": "", "headers": currentHeaders()})
         if dialog.exec():
-            headers = editor.headers()
-            if headers:
-                cfg.set(cfg.defaultRequestHeaders, headers)
+            cfg.set(cfg.headersPresets, [*cfg.headersPresets.value, dialog.preset()])
+            self._reload()
+            if not self.isExpand:
+                self.setExpand(True)
+
+    def _onEditClicked(self, index: int) -> None:
+        from app.view.dialogs.headers_preset_edit import HeadersPresetEditDialog
+        presets = list(cfg.headersPresets.value)
+        dialog = HeadersPresetEditDialog(self.window(), preset=presets[index])
+        if dialog.exec():
+            presets[index] = dialog.preset()
+            cfg.set(cfg.headersPresets, presets)
+            self._reload()
+
+    def _onRemoveClicked(self, index: int) -> None:
+        from qfluentwidgets import MessageBox
+        presets = list(cfg.headersPresets.value)
+        name = presets[index].get("name", self.tr("未命名预设"))
+        dialog = MessageBox(
+            self.tr("删除预设"),
+            self.tr("确定要删除 {0} 吗？").format(name),
+            self.window(),
+        )
+        if not dialog.exec():
+            return
+        row = self._rowWidgets.pop(index)
+        self.viewLayout.removeWidget(row)
+        row.deleteLater()
+        for i in range(index, len(self._rowWidgets)):
+            self._rowWidgets[i]._index = i
+        presets.pop(index)
+        cfg.set(cfg.headersPresets, presets)
+        current = cfg.currentHeadersPreset.value
+        if index <= current:
+            cfg.set(cfg.currentHeadersPreset, max(0, current - 1))
+        newCurrent = currentHeadersPresetIndex()
+        canRemove = len(self._rowWidgets) > 1
+        for i, r in enumerate(self._rowWidgets):
+            r.radioButton.setChecked(i == newCurrent)
+            r.removeButton.setEnabled(canRemove)
+        self.choiceLabel.setText(presets[newCurrent]["name"])
 
 
 class SelectFileCard(SettingCard):
@@ -681,6 +809,7 @@ class RuntimeCard(SettingCard):
 
         self.installButton = PrimaryPushButton(self.tr("一键安装"), self)
         self.refreshButton = ToolButton(FluentIcon.SYNC, self)
+        self.deleteButton = ToolButton(FluentIcon.DELETE, self)
 
         self._initWidget()
         self._initLayout()
@@ -690,6 +819,9 @@ class RuntimeCard(SettingCard):
     def _initWidget(self) -> None:
         if not self._runtime.canInstall:
             self.installButton.hide()
+        self.deleteButton.hide()
+        self.deleteButton.setToolTip(self.tr("卸载"))
+        self.deleteButton.installEventFilter(ToolTipFilter(self.deleteButton))
         self.refreshButton.setToolTip(self.tr("刷新"))
         self.refreshButton.installEventFilter(ToolTipFilter(self.refreshButton))
 
@@ -697,11 +829,14 @@ class RuntimeCard(SettingCard):
         self.hBoxLayout.addWidget(self.installButton, 0, Qt.AlignmentFlag.AlignRight)
         self.hBoxLayout.addSpacing(8)
         self.hBoxLayout.addWidget(self.refreshButton, 0, Qt.AlignmentFlag.AlignRight)
+        self.hBoxLayout.addSpacing(8)
+        self.hBoxLayout.addWidget(self.deleteButton, 0, Qt.AlignmentFlag.AlignRight)
         self.hBoxLayout.addSpacing(16)
 
     def _bind(self) -> None:
         self._runtimeStatusService.statusChanged.connect(self._onRuntimeStatusChanged)
         self.installButton.clicked.connect(self._onInstallClicked)
+        self.deleteButton.clicked.connect(self._onDeleteClicked)
         self.refreshButton.clicked.connect(self._onRefreshClicked)
 
     def refreshStatus(self) -> None:
@@ -709,16 +844,46 @@ class RuntimeCard(SettingCard):
 
     def updateStatus(self, status) -> None:
         self.refreshButton.setEnabled(not status.isBusy)
+        isInstalled = bool(status.path)
+        isManaged = self._runtime.isAppManaged()
+        isUpdateAvailable = (
+            isInstalled and isManaged
+            and status.latestVersion
+            and (not status.version or self._runtime.isNewer(status.version, status.latestVersion))
+        )
+
         if status.isBusy:
             self.setContent(self.tr("正在检测运行时..."))
-        elif status.error:
+            self.installButton.hide()
+            self.deleteButton.hide()
+            return
+
+        if status.error:
             self.setContent(self.tr("检测运行时失败"))
-        elif status.version and status.path:
-            self.setContent(self.tr("版本: {0}\n路径: {1}").format(status.version, status.path))
-        elif status.path:
-            self.setContent(self.tr("路径: {0}").format(status.path))
+        elif isInstalled:
+            if status.version and status.latestVersion:
+                line1 = self.tr("版本: {0}（最新: {1}）").format(status.version, status.latestVersion)
+            elif status.version:
+                line1 = self.tr("版本: {0}").format(status.version)
+            elif status.latestVersion:
+                line1 = self.tr("最新版本: {0}").format(status.latestVersion)
+            else:
+                line1 = ""
+            line2 = self.tr("路径: {0}").format(status.path)
+            self.setContent(f"{line1}\n{line2}" if line1 else line2)
         else:
             self.setContent(self.tr("未检测到可用的 {0}").format(status.name))
+
+        if isUpdateAvailable:
+            self.installButton.setText(self.tr("更新到 {0}").format(status.latestVersion))
+            self.installButton.setVisible(True)
+        elif not isInstalled or not isManaged:
+            self.installButton.setText(self.tr("一键安装"))
+            self.installButton.setVisible(self._runtime.canInstall)
+        else:
+            self.installButton.hide()
+
+        self.deleteButton.setVisible(isInstalled and isManaged)
 
     def _onRefreshClicked(self, *_args) -> None:
         self._runtimeStatusService.invalidate(self._runtime)
@@ -768,3 +933,23 @@ class RuntimeCard(SettingCard):
             position=InfoBarPosition.TOP,
             parent=self.window(),
         )
+
+    def _onDeleteClicked(self) -> None:
+        from qfluentwidgets import MessageBox
+
+        dialog = MessageBox(
+            self.tr("确认卸载"),
+            self.tr("确定要卸载 {0} 吗？").format(self._runtime.name),
+            self.window(),
+        )
+        if not dialog.exec():
+            return
+        try:
+            self._runtime.delete()
+        except Exception as e:
+            InfoBar.error(
+                self.tr("卸载失败"), str(e),
+                duration=-1, position=InfoBarPosition.TOP, parent=self.window(),
+            )
+            return
+        self._runtimeStatusService.invalidate(self._runtime)

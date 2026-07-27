@@ -147,12 +147,12 @@ class MainWindow(MSFluentWindow):
 
     def _onSearchTextChanged(self, text: str) -> None:
         page = self.stackedWidget.currentWidget()
-        if isinstance(page, TaskPage):
+        if hasattr(page, 'setSearchText'):
             page.setSearchText(text)
 
     def _updateSearchTarget(self, page: QWidget) -> None:
         self.searchEdit.clear()
-        if isinstance(page, TaskPage):
+        if hasattr(page, 'searchPlaceholder'):
             self.searchEdit.setPlaceholderText(page.searchPlaceholder)
             self.searchEdit.show()
         else:
@@ -448,6 +448,20 @@ class MainWindow(MSFluentWindow):
                 self.titleBar.minBtn.show()
                 self.titleBar.maxBtn.show()
 
+
+if sys.platform == "darwin":
+    import Cocoa
+    from qframelesswindow.mac import MacFramelessWindowBase
+
+    def _updateSystemTitleBar(self):
+        self._extendTitleBarToClientArea()
+        self.setSystemTitleBarButtonVisible(self.isSystemButtonVisible())
+        nsWindow = self._MacFramelessWindowBase__nsWindow
+        nsWindow.setMovableByWindowBackground_(False)
+        nsWindow.setMovable_(False)
+        nsWindow.setTitleVisibility_(Cocoa.NSWindowTitleHidden)
+
+    MacFramelessWindowBase._updateSystemTitleBar = _updateSystemTitleBar
 
 if sys.platform == "win32":
     from app.platform.windows import isWin10

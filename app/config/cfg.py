@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import json
 import sys
 from enum import Enum
 from re import compile
@@ -143,11 +146,9 @@ class JsonConfigSerializer(ConfigSerializer):
         self._fallback = fallback
 
     def serialize(self, value) -> str:
-        import json
         return json.dumps(value, ensure_ascii=False)
 
     def deserialize(self, value: str):
-        import json
         try:
             result = json.loads(value)
             return result if isinstance(result, self._expected) else self._fallback()
@@ -188,12 +189,29 @@ class IdentityPresetListValidator(ConfigValidator):
 
 class HeadersValidator(ConfigValidator):
     def validate(self, value) -> bool:
-        return isinstance(value, dict) and bool(value) and all(
+        return isinstance(value, dict) and all(
             isinstance(k, str) and isinstance(v, str) for k, v in value.items()
         )
 
     def correct(self, value) -> dict:
         return value if self.validate(value) else dict(BASE_HEADERS)
+
+
+class HeadersPresetListValidator(ConfigValidator):
+    def _isValid(self, item) -> bool:
+        return (
+            isinstance(item, dict)
+            and {"name", "headers"} <= item.keys()
+            and isinstance(item["name"], str)
+            and HeadersValidator().validate(item["headers"])
+        )
+
+    def validate(self, value) -> bool:
+        return isinstance(value, list) and bool(value) and all(map(self._isValid, value))
+
+    def correct(self, value) -> list:
+        presets = [i for i in value if self._isValid(i)] if isinstance(value, list) else []
+        return presets or [{"name": "默认", "headers": dict(BASE_HEADERS)}]
 
 
 class Config(QConfig):
@@ -290,9 +308,12 @@ class Config(QConfig):
 
     # 网络
     clientProfile = ConfigItem("Network", "ClientProfile", "auto", ClientProfileValidator())
-    defaultRequestHeaders = ConfigItem(
-        "Network", "DefaultHeaders", dict(BASE_HEADERS),
-        HeadersValidator(), JsonConfigSerializer(dict, lambda: dict(BASE_HEADERS)),
+    headersPresets = ConfigItem(
+        "Network", "HeadersPresets", [],
+        HeadersPresetListValidator(), JsonConfigSerializer(list, list),
+    )
+    currentHeadersPreset = RangeConfigItem(
+        "Network", "CurrentHeadersPreset", 0, RangeValidator(0, 99)
     )
     identityPresets = ConfigItem(
         "Network", "IdentityPresets",
@@ -306,11 +327,32 @@ class Config(QConfig):
 cfg = Config()
 
 
+def currentHeadersPresetIndex() -> int:
+    return min(cfg.currentHeadersPreset.value, len(cfg.headersPresets.value) - 1)
+
+
+def currentHeaders() -> dict:
+    return dict(cfg.headersPresets.value[currentHeadersPresetIndex()]["headers"])
+
+
+def toProxyUrl(url: str) -> str:
+    if "://" not in url:
+        return "http://" + url
+    if url.startswith("socks://"):
+        return "socks5://" + url[len("socks://"):]
+    return url
+
+
 def proxy() -> str | None:
     if cfg.proxyServer.value == "Off":
         return None
     if cfg.proxyServer.value == "Auto":
         system = getproxies()
-        return next((v for v in system.values() if v), None) if system else None
+        if not system:
+            return None
+        for key in ("http", "https", "socks"):
+            if url := system.get(key):
+                return toProxyUrl(url)
+        return None
     server = str(cfg.proxyServer.value).strip()
-    return server or None
+    return toProxyUrl(server) if server else None

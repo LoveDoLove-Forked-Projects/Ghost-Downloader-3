@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pathlib import PurePosixPath
+
 from PySide6.QtCore import QFileInfo, Signal, Qt
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QFileIconProvider, QHBoxLayout, QWidget
@@ -78,9 +80,10 @@ class DraftCard(QWidget):
 
     def _onNameEditRequested(self) -> None:
         self.nameLabel.hide()
+        self.nameEdit.setText(self._task.name)
         self.nameEdit.show()
         self.nameEdit.setFocus()
-        self.nameEdit.selectAll()
+        self.nameEdit.setSelection(0, len(PurePosixPath(self._task.name).stem))
 
     def _onNameEdited(self) -> None:
         newName = self.nameEdit.text().strip()

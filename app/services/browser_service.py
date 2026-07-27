@@ -4,7 +4,7 @@ import asyncio
 import json
 import struct
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
@@ -19,6 +19,8 @@ from loguru import logger
 from app.config.cfg import cfg
 from app.config.constants import LATEST_EXTENSION_VERSION, VERSION
 from app.config.paths import APP_DATA_DIR
+
+from app.models.task import MergeTaskOptions, PageTaskOptions
 
 if TYPE_CHECKING:
     from PySide6.QtWebSockets import QWebSocket
@@ -79,6 +81,7 @@ class ErrorCode(StrEnum):
 class TaskAction(StrEnum):
     TOGGLE_PAUSE = "toggle_pause"
     CANCEL = "cancel"
+    REMOVE = "remove"
     REDOWNLOAD = "redownload"
     OPEN_FILE = "open_file"
     OPEN_FOLDER = "open_folder"
@@ -199,18 +202,17 @@ class BrowserService(QObject):
 
     def _toResourceTaskOptions(self, resource: dict) -> ResourceTaskOptions:
         from app.models.task import ResourceTaskOptions
+        hdrs = resource.get("headers") or {}
         return ResourceTaskOptions(
             url=toStr(resource, "url"),
             name=toStr(resource, "filename"),
             size=toInt(resource, "size", 0),
             canUseRangeRequests=bool(resource.get("supportsRange")),
-            headers=resource.get("headers") or {},
+            headers=hdrs,
+            sourceUserAgent=hdrs.get("user-agent", ""),
         )
 
     def _toTaskOptions(self, source: TaskSource, payload: dict) -> TaskOptions:
-        from dataclasses import replace
-        from app.models.task import MergeTaskOptions, PageTaskOptions
-
         rawPath = payload.get("path")
         outputFolder = Path(rawPath) if rawPath else Path(cfg.downloadFolder.value)
 
@@ -226,12 +228,14 @@ class BrowserService(QObject):
                     audio=audio,
                 )
             case TaskSource.PAGE_MEDIA:
+                hdrs = payload.get("headers") or {}
                 return PageTaskOptions(
                     url=toStr(payload, "url"),
                     outputFolder=outputFolder,
                     pageUrl=toStr(payload, "pageUrl"),
                     pageTitle=toStr(payload, "pageTitle"),
-                    headers=payload.get("headers") or {},
+                    headers=hdrs,
+                    sourceUserAgent=hdrs.get("user-agent", ""),
                 )
             case TaskSource.RESOURCE | TaskSource.DOWNLOAD:
                 return replace(
@@ -551,6 +555,9 @@ class BrowserService(QObject):
 
             elif action == TaskAction.CANCEL:
                 self._taskService.delete(task, shouldDeleteFiles=True)
+
+            elif action == TaskAction.REMOVE:
+                self._taskService.delete(task, shouldDeleteFiles=False)
 
             elif action == TaskAction.REDOWNLOAD:
                 self._taskService.redownload(task)

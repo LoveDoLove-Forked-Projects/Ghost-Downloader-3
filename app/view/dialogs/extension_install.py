@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize
@@ -99,7 +101,6 @@ class ExtensionInstallDialog(MessageBoxBase):
         scrollArea = ScrollArea(self.widget)
         scrollArea.setWidgetResizable(True)
         scrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scrollArea.enableTransparentBackground()
 
         scrollWidget = QWidget()
         scrollLayout = QVBoxLayout(scrollWidget)
@@ -112,6 +113,7 @@ class ExtensionInstallDialog(MessageBoxBase):
         scrollLayout.addWidget(self.stepsWidget)
 
         scrollArea.setWidget(scrollWidget)
+        scrollArea.enableTransparentBackground()
         self.viewLayout.addWidget(scrollArea)
 
     def _bind(self) -> None:

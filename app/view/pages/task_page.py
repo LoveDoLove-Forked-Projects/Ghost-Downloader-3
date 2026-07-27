@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QSize, QThread, QTimer
 from PySide6.QtGui import QActionGroup, QColor, QCursor, QPainter
-from PySide6.QtWidgets import QGraphicsDropShadowEffect, QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     Action, CaptionLabel, CheckableMenu, CommandBarView, DropDownToolButton,
     FluentIcon, IconWidget, MenuIndicatorType, PushButton,
@@ -58,6 +58,7 @@ class TaskCommandBarView(CommandBarView):
         super().__init__(parent)
         self.redownloadAction = Action(FluentIcon.UPDATE, self.tr("重新下载"), self)
         self.deleteAction = Action(FluentIcon.DELETE, self.tr("删除"), self)
+        self.copyUrlAction = Action(FluentIcon.COPY, self.tr("复制链接"), self)
         self.moveCategoryAction = Action(FluentIcon.TAG, self.tr("移动到分类"), self)
         self.selectAllAction = Action(FluentIcon.CLEAR_SELECTION, self.tr("全选"), self)
         self.selectMissingAction = Action(FluentIcon.REMOVE, self.tr("选择缺失"), self)
@@ -68,6 +69,7 @@ class TaskCommandBarView(CommandBarView):
         self.setIconSize(QSize(18, 18))
         self.addAction(self.redownloadAction)
         self.addAction(self.deleteAction)
+        self.addAction(self.copyUrlAction)
         self.addAction(self.moveCategoryAction)
         self.addSeparator()
         self.addAction(self.selectAllAction)
@@ -142,6 +144,7 @@ class TaskPage(QWidget):
         self._displayOrder: list[str] = []
         self._selectedIds: set[str] = set()
         self._bandSnapshot: set[str] = set()
+        self._bandMerge = set.__or__
         self._runningIds: set[str] = set()
 
         self._refreshListTimer = QTimer(self, singleShot=True)
@@ -294,6 +297,7 @@ class TaskPage(QWidget):
 
         self.commandView.redownloadAction.triggered.connect(self._onRedownloadSelected)
         self.commandView.deleteAction.triggered.connect(self._onDeleteSelected)
+        self.commandView.copyUrlAction.triggered.connect(self._onCopyUrlSelected)
         self.commandView.moveCategoryAction.triggered.connect(self._onMoveCategorySelected)
         self.commandView.selectAllAction.triggered.connect(self.selectAll)
         self.commandView.selectMissingAction.triggered.connect(self.selectMissing)
@@ -475,6 +479,13 @@ class TaskPage(QWidget):
         if not self._categoryFilter:
             allAction.setChecked(True)
 
+    def _onCopyUrlSelected(self) -> None:
+        urls = [
+            task.url for taskId in self._displayOrder
+            if taskId in self._selectedIds and (task := self._taskService.taskById(taskId))
+        ]
+        QApplication.clipboard().setText("\n".join(urls))
+
     def _onRedownloadSelected(self) -> None:
         for taskId in self._displayOrder:
             if taskId in self._selectedIds:
@@ -565,7 +576,7 @@ class TaskPage(QWidget):
             self._cardRefreshTimer.stop()
         stride = TaskCard.ROW_HEIGHT + self.ROW_SPACING
         count = len(self._displayOrder)
-        self.scrollWidget.setFixedHeight(
+        self.scrollWidget.setMinimumHeight(
             count * stride - self.ROW_SPACING + self.BOTTOM_PADDING if count else 0
         )
         self._bandSelector.setItemCount(count)
@@ -639,10 +650,7 @@ class TaskPage(QWidget):
                 card.selectionChanged.connect(
                     lambda checked, extend, tid=taskId: self._onCardSelectionChanged(tid, checked, extend)
                 )
-                # 队列投递：拖拽是阻塞式消息循环，不能挂在卡片的栈帧上
-                card.dragRequested.connect(
-                    self._onCardDragRequested, Qt.ConnectionType.QueuedConnection
-                )
+                card.dragRequested.connect(self._onCardDragRequested)
                 self._liveCards[taskId] = card
                 card.refresh()
             card.setGeometry(self.SIDE_PADDING, idx * stride, max(0, width - 2 * self.SIDE_PADDING), TaskCard.ROW_HEIGHT)
@@ -676,14 +684,16 @@ class TaskPage(QWidget):
 
     # ── band selection ──
 
-    def _onBandDragStarted(self, shiftHeld: bool) -> None:
+    def _onBandDragStarted(self, modifiers: Qt.KeyboardModifiers) -> None:
         if not self._isSelectionMode:
             self.setSelectionMode(True)
-        self._bandSnapshot = set(self._selectedIds) if shiftHeld else set()
+        keepExisting = modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier)
+        self._bandSnapshot = set(self._selectedIds) if keepExisting else set()
+        self._bandMerge = set.__xor__ if modifiers & Qt.KeyboardModifier.ControlModifier else set.__or__
 
     def _onBandChanged(self, first: int, last: int) -> None:
         bandIds = {self._displayOrder[i] for i in range(first, last + 1)} if first >= 0 else set()
-        self._selectedIds = self._bandSnapshot | bandIds
+        self._selectedIds = self._bandMerge(self._bandSnapshot, bandIds)
         for taskId, card in self._liveCards.items():
             card.setChecked(taskId in self._selectedIds)
 

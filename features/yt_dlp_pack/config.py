@@ -50,6 +50,21 @@ def saveCookiesIfBetter(cookieString: str) -> None:
         saveCookies(cookieString)
 
 
+def loadCookieHeader() -> str:
+    path = cookieFile()
+    if not path.is_file():
+        return ""
+    pairs = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            pairs.append(f"{parts[5]}={parts[6]}")
+    return "; ".join(pairs)
+
+
 def clearCookies() -> None:
     path = cookieFile()
     if path.is_file():
@@ -130,6 +145,10 @@ class YouTubeRuntime(BinaryRuntime):
             return ""
         return self.qjsPath()
 
+    def isAppManaged(self) -> bool:
+        folder = Path(ytDlpConfig.installFolder.value)
+        return (folder / "yt_dlp" / "__init__.py").is_file()
+
     def ytDlpFolder(self) -> Path:
         return Path(ytDlpConfig.installFolder.value)
 
@@ -176,11 +195,40 @@ class YouTubeRuntime(BinaryRuntime):
         if ytDlpVersion:
             parts.append(f"yt-dlp {ytDlpVersion}")
         if isQjsOk:
-            parts.append("qjs ✓")
+            parts.append("QuickJS ✓")
         return " | ".join(parts) if parts else ""
 
+    async def fetchLatestVersion(self) -> str:
+        from app.client import buildClient
+        client = buildClient(timeout=15)
+        try:
+            resp = await client.get(PYPI_API)
+            resp.raise_for_status()
+            data = await resp.json()
+            return data.get("info", {}).get("version", "")
+        finally:
+            client.close()
+
+    def isNewer(self, installed: str, latest: str) -> bool:
+        if not installed or not latest:
+            return False
+        prefix = "yt-dlp "
+        if prefix not in installed:
+            return False
+        from PySide6.QtCore import QVersionNumber
+        current = installed.split(prefix, 1)[1].split(" ", 1)[0].split("|", 1)[0].strip()
+        v1 = QVersionNumber.fromString(current)
+        v2 = QVersionNumber.fromString(latest)
+        return v2 > v1
+
+    def delete(self) -> None:
+        import shutil
+        folder = Path(ytDlpConfig.installFolder.value)
+        if folder.exists():
+            shutil.rmtree(folder)
+
     async def installTask(self):
-        from app.config.cfg import cfg
+        from app.config.cfg import cfg, currentHeaders
         from disk_pack.task import ExtractStep, InstallTask
         from http_pack.task import HttpTaskStep
 
@@ -203,7 +251,7 @@ class YouTubeRuntime(BinaryRuntime):
                 stepIndex=1,
                 url=whlUrl,
                 fileSize=whlSize,
-                headers=dict(cfg.defaultRequestHeaders.value),
+                headers=currentHeaders(),
                 subworkerCount=cfg.preBlockNum.value,
                 canUseRangeRequests=True,
                 outputFile=str(installFolder / archiveName),
@@ -240,7 +288,7 @@ class YouTubeRuntime(BinaryRuntime):
             stepIndex=1,
             url=whlUrl,
             fileSize=whlSize,
-            headers=dict(cfg.defaultRequestHeaders.value),
+            headers=currentHeaders(),
             subworkerCount=cfg.preBlockNum.value,
             canUseRangeRequests=True,
             outputFile=str(installFolder / archiveName),
@@ -319,7 +367,7 @@ class CookieSettingCard(SettingCard):
         if hasCookieFile():
             return QCoreApplication.translate("YtDlpConfig", "已导入")
         return QCoreApplication.translate(
-            "YtDlpConfig", "粘贴 Cookie 用于下载需要登录的内容"
+            "YtDlpConfig", "下载需要登录的内容时需要 Cookie，推荐通过浏览器扩展自动导入"
         )
 
     def showEvent(self, event) -> None:
@@ -343,8 +391,9 @@ class CookieSettingCard(SettingCard):
         label = CaptionLabel(
             QCoreApplication.translate(
                 "YtDlpConfig",
-                "打开 YouTube 并登录，按 F12 打开开发者工具，在 Network 标签中"
-                "找到任意请求，复制其 Cookie 请求头的值并粘贴到下方",
+                "安装浏览器扩展后，下载 YouTube 视频时会自动携带登录信息，无需手动操作。\n"
+                "如需手动导入：打开 YouTube 并登录，按 F12 打开开发者工具，在 Network 标签中"
+                "找到任意请求，复制其 Cookie 请求头的值并粘贴到下方。",
             ),
             dialog,
         )

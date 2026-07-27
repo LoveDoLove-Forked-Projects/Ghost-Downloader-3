@@ -4,13 +4,14 @@ import asyncio
 from dataclasses import dataclass, field
 from enum import auto, IntEnum
 from pathlib import Path
+from shutil import move
 from time import time
 from typing import ClassVar, Type, Iterable
 from uuid import uuid4
 
 from loguru import logger
 
-from app.config.cfg import cfg
+from app.config.cfg import cfg, currentHeaders
 from app.platform.filesystem import toSafeFilename
 
 
@@ -54,9 +55,7 @@ class StepError:
 class TaskOptions:
     url: str
     outputFolder: Path = field(default_factory=lambda: Path(cfg.downloadFolder.value))
-    headers: dict[str, str] = field(
-        default_factory=lambda: dict(cfg.defaultRequestHeaders.value)
-    )
+    headers: dict[str, str] = field(default_factory=currentHeaders)
     clientProfile: str = ""
     userAgent: str = ""
     sourceUserAgent: str = ""
@@ -174,7 +173,6 @@ class TaskStep:
         pass
 
     def moveFiles(self, oldFolder: Path, newFolder: Path) -> None:
-        from shutil import move
         rawPath = self.outputPath
         if not rawPath:
             return
