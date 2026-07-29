@@ -16,6 +16,7 @@ from app.config.cfg import cfg
 from app.models.task import Task, TaskError, TaskStep, TaskStatus, SpecialFileSize
 from app.platform.sysio import ftruncate, pwrite
 
+STREAM_READ_TIMEOUT = 30
 PERMANENT_STATUS = frozenset({400, 401, 403, 404, 405, 410, 451})
 FATAL_IO_ERRNO = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EIO, 39, 112})
 
@@ -253,7 +254,7 @@ class HttpTaskStep(TaskStep):
                 recordFile.close()
 
     async def _runSubworker(self, subworker: HttpSubworker, fd: int) -> None:
-        client = buildClient(emulation=self._emulation, userAgent=self.userAgent or None)
+        client = buildClient(emulation=self._emulation, userAgent=self.userAgent or None, readTimeout=STREAM_READ_TIMEOUT)
         try:
             await self._runSubworkerWith(subworker, fd, client)
         finally:
@@ -264,7 +265,7 @@ class HttpTaskStep(TaskStep):
             while True:
                 try:
                     headers = {**self._effectiveHeaders, "range": f"bytes={subworker.position}-", "accept-encoding": "identity"}
-                    response = await client.get(self.url, headers=headers)
+                    response = await client.get(self._effectiveUrl, headers=headers)
                     try:
                         status = response.status.as_int()
                         if status in PERMANENT_STATUS or response.headers.contains_key("cf-mitigated"):
@@ -298,7 +299,7 @@ class HttpTaskStep(TaskStep):
                 try:
                     ftruncate(fd, 0)
                     subworker.receivedBytes = 0
-                    response = await client.get(self.url, headers=dict(self._effectiveHeaders))
+                    response = await client.get(self._effectiveUrl, headers=dict(self._effectiveHeaders))
                     try:
                         status = response.status.as_int()
                         if status in PERMANENT_STATUS or response.headers.contains_key("cf-mitigated"):
@@ -334,7 +335,7 @@ class HttpTaskStep(TaskStep):
                         "range": f"bytes={subworker.position}-{subworker.end}",
                         "accept-encoding": "identity",
                     }
-                    response = await client.get(self.url, headers=headers)
+                    response = await client.get(self._effectiveUrl, headers=headers)
                     try:
                         status = response.status.as_int()
                         if status in PERMANENT_STATUS or response.headers.contains_key("cf-mitigated"):
@@ -387,6 +388,15 @@ class HttpTaskStep(TaskStep):
             self._effectiveHeaders["user-agent"] = self.userAgent
 
         self._emulation = toEmulation(self.clientProfile or cfg.clientProfile.value, "")
+
+        probeHeaders = {**self._effectiveHeaders, "range": "bytes=0-0", "accept-encoding": "identity"}
+        client = buildClient(emulation=self._emulation, userAgent=self.userAgent or None, timeout=30)
+        try:
+            response = await client.get(self.url, headers=probeHeaders)
+            self._effectiveUrl = str(response.url)
+            response.close()
+        finally:
+            client.close()
 
         restored = False
         if self.canUseRangeRequests:
