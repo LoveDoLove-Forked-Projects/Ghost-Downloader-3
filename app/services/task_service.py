@@ -10,6 +10,7 @@ from loguru import logger
 
 from app.config.cfg import cfg
 from app.config.paths import APP_DATA_DIR
+from app.platform.filesystem import splitStemExt
 
 if TYPE_CHECKING:
     from app.models.task import Task
@@ -107,6 +108,18 @@ class TaskQueue:
     def isWaiting(self, taskId: str) -> bool:
         return taskId in self._waiting
 
+    def waitingOrder(self) -> list[str]:
+        return list(self._waiting)
+
+    def moveToFront(self, taskIds: list[str]) -> bool:
+        targets = [tid for tid in self._waiting if tid in set(taskIds)]
+        if not targets:
+            return False
+        for tid in targets:
+            self._waiting.remove(tid)
+        self._waiting[:0] = targets
+        return True
+
     def runningCount(self) -> int:
         return len(self._running)
 
@@ -125,6 +138,7 @@ class TaskService(QObject):
     taskCompleted = Signal(object)
     taskFailed = Signal(object)
     tasksAllCompleted = Signal()
+    queueChanged = Signal()
     fileDisappeared = Signal(object)
     diskSpaceInsufficient = Signal(int, int)
 
@@ -171,7 +185,7 @@ class TaskService(QObject):
             return -1.0
         return min(100.0, totalReceived / totalSize * 100)
 
-    def add(self, task: Task) -> None:
+    def add(self, task: Task, autoStart=True) -> None:
         if task.taskId in self._store.tasks:
             return
         if cfg.isCategoryEnabled.value:
@@ -181,10 +195,12 @@ class TaskService(QObject):
                 folder = self._categoryService.folderOf(task.category)
                 if folder:
                     task.outputFolder = Path(folder)
-        task.deduplicateFilename()
+        self._deduplicateOutput(task)
         self._store.add(task)
         self._flushTimer.start()
         self.taskAdded.emit(task)
+        if not autoStart:
+            return
         if task.fileSize > 0:
             try:
                 free = disk_usage(task.outputFolder).free
@@ -194,6 +210,24 @@ class TaskService(QObject):
             except OSError:
                 pass
         self._schedule(task)
+
+    def _deduplicateOutput(self, task: Task) -> None:
+        storePaths = {t.outputPath for t in self._store.tasks.values()}
+
+        def isTaken() -> bool:
+            op = task.outputPath
+            return op in storePaths or Path(op).exists() or Path(f"{op}.ghd").exists()
+
+        if not isTaken():
+            return
+
+        stem, ext = splitStemExt(task.name)
+        index = 1
+        while True:
+            task.setName(f"{stem}({index}){ext}")
+            if not isTaken():
+                break
+            index += 1
 
     def start(self, task: Task) -> None:
         if self._queue.isRunning(task.taskId) or self._queue.isWaiting(task.taskId):
@@ -297,6 +331,13 @@ class TaskService(QObject):
         for task in self._store.tasks.values():
             if task.status in {TaskStatus.RUNNING, TaskStatus.WAITING}:
                 task.setStatus(TaskStatus.PAUSED)
+
+    def waitingOrder(self) -> list[str]:
+        return self._queue.waitingOrder()
+
+    def moveToFront(self, taskIds: list[str]) -> None:
+        if self._queue.moveToFront(taskIds):
+            self.queueChanged.emit()
 
     def flush(self) -> None:
         self._flushTimer.stop()

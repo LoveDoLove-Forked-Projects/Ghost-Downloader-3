@@ -27,23 +27,27 @@ from app.view.components.setting_cards import (
     HeadersPresetSettingCard, IdentitySettingCard, LineEditSettingCard,
     PercentSpinBoxSettingCard, ProxySettingCard, SpinBoxSettingCard,
 )
+from app.update import fetchRelease, isOutdated, showReleaseDialog
 from app.view.components.editors import FolderPicker
 
 
 class SettingPage(ScrollArea):
 
-    def __init__(self, featureService, browserService, coroutineRunner, categoryService, parent=None):
+    def __init__(self, featureService, browserService, coroutineRunner, categoryService, taskService, parent=None):
         super().__init__(parent)
         self._featureService = featureService
         self._browserService = browserService
         self._coroutineRunner = coroutineRunner
         self._categoryService = categoryService
+        self._taskService = taskService
         self.container = QWidget()
         self.vBoxLayout = QVBoxLayout(self.container)
         self.vBoxLayout.addStretch(1)
 
         self.generalGroup = CollapsibleSettingCardGroup(self.tr("综合下载设置"), "general", self.container)
         self.categoryGroup = CollapsibleSettingCardGroup(self.tr("下载分类"), "category", self.container)
+        if sys.platform != "darwin":
+            self.associationGroup = CollapsibleSettingCardGroup(self.tr("关联设置"), "association", self.container)
         self.browserGroup = CollapsibleSettingCardGroup(self.tr("浏览器扩展"), "browser", self.container)
         self.aria2RpcGroup = CollapsibleSettingCardGroup(self.tr("Aria2 RPC 兼容"), "aria2rpc", self.container)
         self.personalGroup = CollapsibleSettingCardGroup(self.tr("个性化"), "personalization", self.container)
@@ -180,12 +184,6 @@ class SettingPage(ScrollArea):
             cfg.isBrowserExtensionEnabled,
         )
 
-        self.urlSchemeCard = SwitchSettingCard(
-            FluentIcon.LINK, self.tr("注册 URL 协议"),
-            self.tr("注册 ghostdownloader:// 协议，允许浏览器扩展启动桌面端"),
-            cfg.isUrlSchemeRegistered,
-        ) if sys.platform != "darwin" else None
-
         browserCards = [
             self.browserEnableCard,
             SwitchSettingCard(FluentIcon.CHAT, self.tr("接管下载时进入草稿模式"),
@@ -196,10 +194,35 @@ class SettingPage(ScrollArea):
             self.chromiumInstallCard,
             self.browserPortCard,
         ]
-        if self.urlSchemeCard:
-            browserCards.insert(2, self.urlSchemeCard)
-
         self.browserGroup.addSettingCards(browserCards)
+
+        if sys.platform != "darwin":
+            self.urlSchemeCard = SwitchSettingCard(
+                FluentIcon.LINK, self.tr("允许浏览器扩展唤醒"),
+                self.tr("浏览器扩展可通过 ghostdownloader:// 协议启动桌面端"),
+                cfg.isUrlSchemeRegistered,
+            )
+            associationCards = [self.urlSchemeCard]
+            for pack in self._featureService.packs:
+                if pack.config is None:
+                    continue
+                fileTypes = pack.fileTypes()
+                if fileTypes and pack.config.associateFileTypes is not None:
+                    extensions = "/".join(ext for ft in fileTypes for ext in ft.extensions)
+                    associationCards.append(SwitchSettingCard(
+                        FluentIcon.DOCUMENT, self.tr("关联 {0} 文件").format(extensions),
+                        self.tr("双击 {0} 文件时用 Ghost Downloader 打开").format(extensions),
+                        pack.config.associateFileTypes,
+                    ))
+                schemes = pack.uriSchemes()
+                if schemes and pack.config.associateUriSchemes is not None:
+                    schemeText = "/".join(s.displayName for s in schemes)
+                    associationCards.append(SwitchSettingCard(
+                        FluentIcon.LINK, self.tr("处理 {0} 链接").format(schemeText),
+                        self.tr("点击 {0} 链接时唤起 Ghost Downloader").format(schemeText),
+                        pack.config.associateUriSchemes,
+                    ))
+            self.associationGroup.addSettingCards(associationCards)
 
         self.aria2RpcGroup.addSettingCards([
             SwitchSettingCard(
@@ -341,6 +364,8 @@ class SettingPage(ScrollArea):
     def _initLayout(self) -> None:
         self.addSettingGroup(self.generalGroup)
         self.addSettingGroup(self.categoryGroup)
+        if sys.platform != "darwin":
+            self.addSettingGroup(self.associationGroup)
         self.addSettingGroup(self.browserGroup)
         self.addSettingGroup(self.aria2RpcGroup)
         self.addSettingGroup(self.personalGroup)
@@ -366,7 +391,7 @@ class SettingPage(ScrollArea):
         self.regenerateTokenButton.clicked.connect(self._onRegenerateTokenClicked)
         self.chromiumInstallCard.clicked.connect(self._onChromiumInstallClicked)
         self.exportExtensionButton.clicked.connect(self._onExportExtensionClicked)
-        if self.urlSchemeCard:
+        if sys.platform != "darwin":
             self.urlSchemeCard.checkedChanged.connect(self._onUrlSchemeChanged)
         self.autoRunCard.checkedChanged.connect(self._onRunAtLoginChanged)
         self.aboutCard.clicked.connect(self._onAboutCardClicked)
@@ -466,8 +491,6 @@ class SettingPage(ScrollArea):
         QApplication.instance().quit()
 
     def _onAboutCardClicked(self) -> None:
-        from app.update import fetchRelease
-
         InfoBar.info(self.tr("检查更新"), self.tr("正在检查更新..."),
                      duration=1500, position=InfoBarPosition.BOTTOM_RIGHT, parent=self.window())
         self._coroutineRunner.submit(
@@ -477,17 +500,13 @@ class SettingPage(ScrollArea):
         )
 
     def _onUpdateChecked(self, release) -> None:
-        from app.config.constants import VERSION
-        from app.update import isOutdated
-
         if not isOutdated(release):
             InfoBar.success(self.tr("当前已是最新版本"),
                             self.tr("当前版本 {0}，最新版本 {1}").format(VERSION, release.version),
                             duration=3000, position=InfoBarPosition.BOTTOM_RIGHT, parent=self.window())
             return
 
-        from app.update import showReleaseDialog
-        showReleaseDialog(release, self.window())
+        showReleaseDialog(release, self.window(), self._coroutineRunner, self._featureService, self._taskService)
 
     def _onUpdateCheckFailed(self, error: str) -> None:
         InfoBar.error(self.tr("检查更新失败"), self.tr("无法获取最新版本信息"),

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QCoreApplication, QRectF, QSize, QUrl, Signal
+from PySide6.QtCore import Qt, QCoreApplication, QRect, QRectF, QSize, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QMovie, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
@@ -656,27 +657,30 @@ class AdvancedOptionsPage(QWidget):
             self.tr("按文件类型自动保存到 视频、音频、文档 等子文件夹"),
             isChecked=cfg.isCategoryEnabled.value, parent=self,
         )
-        self.fileAssocCard = OptionCard(
-            FluentIcon.DOCUMENT, self.tr("关联文件类型"),
-            self.tr("双击 .torrent 等文件时自动用 Ghost Downloader 打开"),
-            isChecked=self._isFileAssociationEnabled(), parent=self,
-        )
-        self.urlSchemeCard = OptionCard(
-            FluentIcon.LINK, self.tr("注册 URL 协议"),
-            self.tr("允许网页通过 ghostdownloader:// 链接唤起本应用"),
-            isChecked=cfg.isUrlSchemeRegistered.value, parent=self,
-        )
+        if sys.platform != "darwin":
+            self.fileAssocCard = OptionCard(
+                FluentIcon.DOCUMENT, self.tr("关联文件类型"),
+                self.tr("双击 .torrent 等文件时用 Ghost Downloader 打开"),
+                isChecked=self._featureService.isFileAssociationEnabled(), parent=self,
+            )
+            self.uriSchemeCard = OptionCard(
+                FluentIcon.LINK, self.tr("处理协议链接"),
+                self.tr("点击 Magnet/eD2k/FTP 链接时唤起 Ghost Downloader"),
+                isChecked=self._featureService.isUriSchemeAssociationEnabled(), parent=self,
+            )
+            self.urlSchemeCard = OptionCard(
+                FluentIcon.GLOBE, self.tr("允许浏览器扩展唤醒"),
+                self.tr("浏览器扩展可通过 ghostdownloader:// 协议启动桌面端"),
+                isChecked=cfg.isUrlSchemeRegistered.value, parent=self,
+            )
+        else:
+            self.fileAssocCard = None
+            self.uriSchemeCard = None
+            self.urlSchemeCard = None
         self.aria2Card = OptionCard(
             FluentIcon.COMMAND_PROMPT, self.tr("Aria2 RPC 兼容"),
             self.tr("让支持 Aria2 的工具和网站把下载任务发给 Ghost Downloader"),
             isChecked=cfg.isAria2RpcEnabled.value, parent=self,
-        )
-
-    def _isFileAssociationEnabled(self) -> bool:
-        return any(
-            pack.config.associateFileTypes.value
-            for pack in self._featureService.packs
-            if pack.config is not None and pack.config.associateFileTypes is not None
         )
 
     def _initLayout(self) -> None:
@@ -689,8 +693,9 @@ class AdvancedOptionsPage(QWidget):
         listLayout = QVBoxLayout()
         listLayout.setSpacing(8)
         for card in [self.runAtLoginCard, self.clipboardCard, self.categoryCard,
-                     self.fileAssocCard, self.urlSchemeCard, self.aria2Card]:
-            listLayout.addWidget(card)
+                     self.fileAssocCard, self.uriSchemeCard, self.urlSchemeCard, self.aria2Card]:
+            if card is not None:
+                listLayout.addWidget(card)
         layout.addLayout(listLayout)
         layout.addStretch(1)
 
@@ -704,12 +709,15 @@ class AdvancedOptionsPage(QWidget):
 
         cfg.set(cfg.isCategoryEnabled, self.categoryCard.isChecked())
 
-        for pack in self._featureService.packs:
-            config = pack.config
-            if config is not None and config.associateFileTypes is not None:
-                cfg.set(config.associateFileTypes, self.fileAssocCard.isChecked())
+        if self.fileAssocCard is not None:
+            for pack in self._featureService.packs:
+                config = pack.config
+                if config is not None and config.associateFileTypes is not None:
+                    cfg.set(config.associateFileTypes, self.fileAssocCard.isChecked())
+                if config is not None and config.associateUriSchemes is not None:
+                    cfg.set(config.associateUriSchemes, self.uriSchemeCard.isChecked())
 
-        if self.urlSchemeCard.isChecked() != cfg.isUrlSchemeRegistered.value:
+        if self.urlSchemeCard is not None:
             from app.platform.url_scheme import registerUrlScheme, unregisterUrlScheme
             if self.urlSchemeCard.isChecked():
                 registerUrlScheme()
@@ -779,7 +787,6 @@ class OobeWindow(FluentWidget):
         self._currentIndex = 0
         self._isFinished = False
         self._queuedRuntimeIds: set[str] = set()
-        self._translator = None
         self._initWidget()
         self._initContent()
         self._initLayout()
@@ -792,10 +799,15 @@ class OobeWindow(FluentWidget):
         self.setWindowTitle("Ghost Downloader")
         self.setWindowIcon(QIcon(":/image/logo.png"))
         self.titleBar.hBoxLayout.insertSpacing(2, 6)
+        if sys.platform == "darwin":
+            self.titleBar.hBoxLayout.insertSpacing(0, 60)
         self.titleBar.maxBtn.hide()
         self.setFixedSize(WINDOW_SIZE)
         desktop = QApplication.primaryScreen().availableGeometry()
         self.move(desktop.center() - self.rect().center())
+
+    def systemTitleBarRect(self, size) -> QRect:
+        return QRect(0, 10, 75, size.height())
 
     def _initContent(self) -> None:
         self.welcomePage = WelcomePage(self)
@@ -849,7 +861,7 @@ class OobeWindow(FluentWidget):
 
     def _bind(self) -> None:
         self.welcomePage.startClicked.connect(self._onNextClicked)
-        self.basicSettingsPage.languageChanged.connect(self._onLanguageChanged)
+        self.basicSettingsPage.languageChanged.connect(self._rebuildContent)
         self.completePage.finishClicked.connect(self._finish)
         self.backButton.clicked.connect(self._onBackClicked)
         self.nextButton.clicked.connect(self._onNextClicked)
@@ -857,21 +869,6 @@ class OobeWindow(FluentWidget):
 
     def onPairRequested(self, request: dict) -> None:
         self.browserExtensionPage.onPairRequested(request)
-
-    def _onLanguageChanged(self) -> None:
-        # 延迟到信号栈外重建：发出信号的下拉框会随内容区一起销毁
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self._reloadLanguage)
-
-    def _reloadLanguage(self) -> None:
-        from PySide6.QtCore import QTranslator
-        application = QApplication.instance()
-        if self._translator is not None:
-            application.removeTranslator(self._translator)
-        self._translator = QTranslator(application)
-        self._translator.load(cfg.language.value.value, "gd3", ".", ":/i18n")
-        application.installTranslator(self._translator)
-        self._rebuildContent()
 
     def _rebuildContent(self) -> None:
         index = self._currentIndex
@@ -906,8 +903,6 @@ class OobeWindow(FluentWidget):
 
         if self._currentIndex == 3:
             self._installSelectedRuntimes()
-        if self._currentIndex == 4:
-            self.advancedOptionsPage.save()
 
         self._currentIndex += 1
         self.stackedWidget.setCurrentIndex(self._currentIndex)
@@ -954,6 +949,7 @@ class OobeWindow(FluentWidget):
         if self._isFinished:
             return
         self._isFinished = True
+        self.advancedOptionsPage.save()
         cfg.set(cfg.hasCompletedOobe, True)
         self.finished.emit()
         self.close()

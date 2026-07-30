@@ -6,7 +6,7 @@ from loguru import logger
 
 from app.config.paths import APP_DATA_DIR
 
-logger.add(f"{APP_DATA_DIR}/GhostDownloader.log", rotation="512 KB")
+logger.add(f"{APP_DATA_DIR}/GhostDownloader.log", rotation="512 KB", retention=5)
 
 
 def _exceptionHook(exceptionType, value, tb):
@@ -175,7 +175,7 @@ def startApp(application, isSilent=False):
         window.addTasks(tasks)
 
     signalBus.activationRequested.connect(show)
-    signalBus.openFileRequested.connect(lambda uris: show().addUrls(uris))
+    signalBus.openUriRequested.connect(lambda uris: show().addUrls(uris))
     signalBus.exceptionCaught.connect(lambda msg: show().alertException(msg))
     browserService.taskDraftRequested.connect(onBrowserDraft)
     browserService.pairRequested.connect(lambda req: show().confirmPair(req))
