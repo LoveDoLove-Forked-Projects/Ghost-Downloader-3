@@ -200,7 +200,7 @@ class YouTubeExtractStep(TaskStep):
 
         from .config import youTubeRuntime
         if not youTubeRuntime.path():
-            raise TaskError("{name} 未安装，请在设置中安装", name="YouTube 运行环境")
+            raise TaskError("{name} 未安装，请在设置中安装", name=youTubeRuntime.name)
 
         url = self.videoUrl or self.task.url
         try:
@@ -229,7 +229,7 @@ class YouTubeExtractStep(TaskStep):
             from app.platform.filesystem import toSafeFilename
             safeName = toSafeFilename(title)
             if safeName:
-                if self.fileIndex == 0 and not self.task.isPlaylist:
+                if self.fileIndex == 0 and self.task.files is None:
                     ext = "m4a" if not videoFmt else "mp4"
                     self.task.setName(f"{safeName}.{ext}")
                 for step in self.task.steps:

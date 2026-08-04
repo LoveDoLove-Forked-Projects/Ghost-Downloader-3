@@ -8,6 +8,8 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from loguru import logger
+
 from app.config.cfg import cfg
 from app.format import toBytes
 from app.models.task import Task, TaskError, TaskStep, TaskStatus
@@ -173,9 +175,13 @@ class M3U8TaskStep(TaskStep):
         if not outputDir.is_dir():
             return
         prefix = f"{self._saveName}."
-        for candidate in outputDir.iterdir():
+        try:
+            entries = list(outputDir.iterdir())
+        except OSError:
+            return
+        for candidate in entries:
             if candidate.is_file() and candidate.name.startswith(prefix) and candidate.name != self.task.name:
-                candidate.unlink(missing_ok=True)
+                deletePath(candidate)
 
     def _buildCommand(self) -> list[str]:
         def toBool(v: bool) -> str:
@@ -317,12 +323,15 @@ class M3U8TaskStep(TaskStep):
             self.speed = 0 if recordMatch.group(4) == "-" else toBytes(recordMatch.group(5), recordMatch.group(6))
 
     async def _readOutput(self, stream: asyncio.StreamReader):
+        rawChunks = []
         buffer = ""
         while True:
             chunk = await stream.read(4096)
             if not chunk:
                 break
-            buffer += chunk.decode("utf-8", errors="ignore")
+            raw = chunk.decode("utf-8", errors="ignore")
+            rawChunks.append(raw)
+            buffer += raw
             buffer = buffer.replace("\r\n", "\n").replace("\r", "\n")
             lines = buffer.split("\n")
             buffer = lines.pop()
@@ -334,6 +343,7 @@ class M3U8TaskStep(TaskStep):
                 buffer = buffer[-4096:]
         if buffer.strip():
             self._parseOutputLine(buffer)
+        self._processOutput = "".join(rawChunks)
 
     def _findOutputFile(self) -> bool:
         Path(f"{self.outputPath}.ghd").unlink(missing_ok=True)
@@ -352,8 +362,15 @@ class M3U8TaskStep(TaskStep):
         expectedSuffix = f".{self.actualExtension or fallbackExt}"
         prefix = self._saveName.lower()
 
+        try:
+            entries = list(outputDir.iterdir())
+        except PermissionError:
+            if sys.platform == "darwin":
+                raise TaskError("macOS 阻止了访问下载目录，请在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中添加 Ghost Downloader")
+            raise TaskError("无权限访问下载目录：{folder}", folder=outputDir)
+
         candidates = [
-            c for c in outputDir.iterdir()
+            c for c in entries
             if c.is_file()
             and c.suffix.lower() not in IGNORED_OUTPUT_SUFFIXES
             and c.name.lower().startswith(prefix)
@@ -381,11 +398,9 @@ class M3U8TaskStep(TaskStep):
         Path(self._tempFolder).mkdir(parents=True, exist_ok=True)
         Path(f"{self.outputPath}.ghd").touch(exist_ok=True)
 
-        env = dict(os.environ)
-        if sys.platform != "win32":
-            env.setdefault("TERM", "dumb")
+        env = None
         if self.shouldKeepImageSegments:
-            env["RE_KEEP_IMAGE_SEGMENTS"] = "1"
+            env = {**os.environ, "RE_KEEP_IMAGE_SEGMENTS": "1"}
 
         outputTask = None
         try:
@@ -404,6 +419,9 @@ class M3U8TaskStep(TaskStep):
             await outputTask
 
             if self._process.returncode != 0 and not self._stopping:
+                output = getattr(self, "_processOutput", "")
+                if output:
+                    logger.warning("N_m3u8DL-RE output:\n{}", output[-8192:])
                 raise TaskError(
                     "进程异常退出（{code}）：{detail}",
                     code=self._process.returncode,
