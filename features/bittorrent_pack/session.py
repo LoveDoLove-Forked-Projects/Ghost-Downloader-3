@@ -31,6 +31,34 @@ _STATE_TEXT = {
     "queued_for_checking": "等待校验",
 }
 
+DHT_BOOTSTRAP_NODES = (
+    "router.bittorrent.com:6881, router.utorrent.com:6881, "
+    "dht.transmissionbt.com:6881, dht.libtorrent.org:25401"
+)
+
+ALERT_MASK = (
+    lt.alert.category_t.error_notification
+    | lt.alert.category_t.port_mapping_notification
+    | lt.alert.category_t.storage_notification
+    | lt.alert.category_t.status_notification
+)
+
+DHT_STATE_FILE = "bt_dht_state.dat"
+
+PROXY_TYPES = {
+    "http": lt.proxy_type_t.http,
+    "https": lt.proxy_type_t.http,
+    "socks4": lt.proxy_type_t.socks4,
+    "socks5": lt.proxy_type_t.socks5,
+    "socks5h": lt.proxy_type_t.socks5,
+}
+PROXY_TYPES_AUTH = {
+    "http": lt.proxy_type_t.http_pw,
+    "https": lt.proxy_type_t.http_pw,
+    "socks5": lt.proxy_type_t.socks5_pw,
+    "socks5h": lt.proxy_type_t.socks5_pw,
+}
+
 _ERROR_ALERTS = (
     lt.file_error_alert,
     lt.metadata_failed_alert,
@@ -110,9 +138,12 @@ class BTSession(QObject):
 
     # ── public interface ──
 
+    def open(self) -> None:
+        self._ensureSession()
+
     async def run(self, taskId: str, params: TorrentParams,
                   onProgress: Callable[[TorrentProgress], None] | None = None) -> bytes:
-        self._open()
+        self._ensureSession()
         handle = self._addTorrent(params)
 
         handle.resume()
@@ -148,7 +179,7 @@ class BTSession(QObject):
         return self._resumeCache.pop(taskId, b"")
 
     async def fetchMetadata(self, magnetUri: str, trackers: list[str]) -> bytes:
-        self._open()
+        self._ensureSession()
 
         params = lt.parse_magnet_uri(magnetUri)
         params.trackers = list(dict.fromkeys(
@@ -196,6 +227,7 @@ class BTSession(QObject):
         return self._resumeCache.pop(taskId, None)
 
     async def close(self) -> None:
+        self._saveDhtState()
         waiters = []
         for entry in list(self._active.values()):
             try:
@@ -239,10 +271,11 @@ class BTSession(QObject):
 
     # ── session lifecycle ──
 
-    def _open(self) -> None:
+    def _ensureSession(self) -> None:
         if self._session is None:
             from app.config.constants import VERSION
-            self._session = lt.session({
+            params = self._loadDhtState()
+            params.settings = {
                 "user_agent": f"GhostDownloader/{VERSION} libtorrent/{lt.__version__}",
                 "listen_interfaces": f"0.0.0.0:{bittorrentConfig.listenPort.value}",
                 "connections_limit": bittorrentConfig.maxConnections.value,
@@ -250,13 +283,43 @@ class BTSession(QObject):
                 "upload_rate_limit": int(bittorrentConfig.maxUploadSpeed.value),
                 "enable_dht": bittorrentConfig.enableDht.value,
                 "enable_lsd": bittorrentConfig.enableLsd.value,
+                "dht_bootstrap_nodes": DHT_BOOTSTRAP_NODES,
                 "announce_to_all_trackers": True,
                 "announce_to_all_tiers": True,
-                "alert_mask": lt.alert.category_t.all_categories,
+                "enable_upnp": True,
+                "enable_natpmp": True,
+                "alert_mask": ALERT_MASK,
                 **self._proxySettings(),
-            })
+            }
+            self._session = lt.session(params)
         if self._poller is None or self._poller.done():
             self._poller = asyncio.get_running_loop().create_task(self._supervise())
+
+    def _loadDhtState(self) -> lt.session_params:
+        from app.config.paths import APP_DATA_DIR
+        path = Path(APP_DATA_DIR) / DHT_STATE_FILE
+        if path.exists():
+            try:
+                return lt.read_session_params(
+                    path.read_bytes(), lt.save_state_flags_t.save_dht_state
+                )
+            except Exception as e:
+                logger.warning("加载 DHT 状态失败: {}", e)
+        return lt.session_params()
+
+    def _saveDhtState(self) -> None:
+        if self._session is None:
+            return
+        from app.config.paths import APP_DATA_DIR
+        try:
+            state = self._session.save_state(
+                lt.save_state_flags_t.save_dht_state
+            )
+            (Path(APP_DATA_DIR) / DHT_STATE_FILE).write_bytes(
+                lt.bencode(state)
+            )
+        except Exception as e:
+            logger.warning("保存 DHT 状态失败: {}", e)
 
     # ── torrent management ──
 
@@ -479,11 +542,19 @@ class BTSession(QObject):
         if not url:
             return {}
         parsed = urlsplit(url)
-        if parsed.scheme.lower() not in {"socks5", "socks5h"} or not parsed.hostname or not parsed.port:
+        scheme = parsed.scheme.lower()
+        if not parsed.hostname or not parsed.port:
             return {}
         hasCredentials = bool(parsed.username or parsed.password)
+        proxyType = PROXY_TYPES_AUTH.get(scheme) if hasCredentials else None
+        if proxyType is None:
+            proxyType = PROXY_TYPES.get(scheme)
+        if proxyType is None:
+            return {}
+        if scheme == "socks4" and hasCredentials:
+            logger.warning("SOCKS4 不支持认证，凭据将被忽略")
         return {
-            "proxy_type": lt.proxy_type_t.socks5_pw if hasCredentials else lt.proxy_type_t.socks5,
+            "proxy_type": proxyType,
             "proxy_hostname": parsed.hostname,
             "proxy_port": parsed.port,
             "proxy_username": parsed.username or "",
