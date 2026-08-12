@@ -57,10 +57,10 @@ def createServices(coroutineRunner, categoryService, speedMeter):
 
 def loadPacks(featureService, coroutineRunner, speedMeter):
     from app.models.pack import PackConfig, PackServices
-    from app.services.update_service import applyPendingPackUpdates
+    from app.services.update_service import installPendingPacks
     from app.config.paths import executableDir
 
-    applyPendingPackUpdates(executableDir / "features")
+    installPendingPacks(executableDir / "features")
 
     services = PackServices(
         coroutineRunner=coroutineRunner,
@@ -82,17 +82,11 @@ def bindNotifications(taskService, notifyCompleted, notifyDiskSpace):
     taskService.diskSpaceInsufficient.connect(notifyDiskSpace)
 
 
-def checkUpdateAtStartup(coroutineRunner, onUpdateAvailable):
+def checkUpdateAtStartup(updateService):
     from app.config.cfg import cfg
     if not cfg.shouldCheckUpdateAtStartup.value:
         return
-    from app.update import fetchRelease, isOutdated
-
-    def _onFetched(release):
-        if isOutdated(release):
-            onUpdateAvailable(release)
-
-    coroutineRunner.submit(fetchRelease(), done=_onFetched)
+    updateService.check()
 
 
 def stopEngine(taskService, browserService, aria2RpcServer, featureService, coroutineRunner, updateService=None):
@@ -104,5 +98,4 @@ def stopEngine(taskService, browserService, aria2RpcServer, featureService, coro
     taskService.flush()
     if updateService is not None:
         updateService.apply()
-        updateService.startUpdater()
     coroutineRunner.stop()

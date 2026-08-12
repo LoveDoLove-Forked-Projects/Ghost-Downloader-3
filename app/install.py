@@ -28,10 +28,6 @@ def isArchive(name: str) -> bool:
     return any(lower.endswith(suffix) for suffix in ARCHIVE_SUFFIXES)
 
 
-def assetNameFromUrl(url: str) -> str:
-    return PurePosixPath(urlparse(url).path).name
-
-
 @dataclass(kw_only=True, eq=False)
 class InstallTask(Task):
     hasOutputFile = False
@@ -241,7 +237,7 @@ async def createInstallTask(
 ) -> InstallTask:
     from app.models.task import TaskOptions
 
-    assetName = assetNameFromUrl(url)
+    assetName = PurePosixPath(urlparse(url).path).name
 
     download = await delegate(TaskOptions(url=url, outputFolder=outputFolder))
     downloadStep = download.steps[0]
@@ -272,7 +268,7 @@ async def createInstallTask(
             TaskOptions(url=sha256Url, outputFolder=outputFolder)
         )
         checksumStep = checksumDownload.steps[0]
-        sha256Path = toPosixPath(outputFolder / assetNameFromUrl(sha256Url))
+        sha256Path = toPosixPath(outputFolder / PurePosixPath(urlparse(sha256Url).path).name)
         checksumStep.outputFile = sha256Path
         checksumStep.stepIndex = stepIndex
         task.addStep(checksumStep)

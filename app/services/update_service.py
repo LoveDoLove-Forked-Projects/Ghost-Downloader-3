@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import os
+import platform
 import shutil
 import subprocess
 import sys
+import tarfile
+import zipfile
 from dataclasses import dataclass, replace
 from enum import auto, IntEnum
 from pathlib import Path
@@ -16,13 +19,83 @@ from loguru import logger
 from app.client import buildClient, fetchFile
 from app.config.constants import VERSION
 from app.config.paths import APP_DATA_DIR, executableDir
+from app.platform.filesystem import matchChecksum
+from app.services.pack_loader import PackManifest
 
 if TYPE_CHECKING:
     from app.services.coroutine_runner import CoroutineRunner
 
 STAGING_DIR = Path(APP_DATA_DIR) / "update_staging"
 
-def applyPendingPackUpdates(featuresDir: Path) -> None:
+SOURCES = {
+    "github": {
+        "api": "https://api.github.com/repos/XiaoYouChR/Ghost-Downloader-3/releases/latest",
+        "headers": {"accept": "application/vnd.github+json"},
+    },
+    "gitcode": {
+        "api": "https://gitcode.com/api/v5/repos/XiaoYouChR/Ghost-Downloader-3/releases/latest",
+        "headers": {},
+    },
+}
+
+OS_MAP = {"win32": "Windows", "darwin": "macOS", "linux": "Linux"}
+MACHINE_MAP = {"AMD64": "x86_64", "x86_64": "x86_64", "aarch64": "arm64", "arm64": "arm64"}
+
+
+def buildPlatformKey() -> str:
+    return f"{OS_MAP[sys.platform]}-{MACHINE_MAP[platform.machine()]}"
+
+
+def isNewer(current: str, latest: str) -> bool:
+    v1 = QVersionNumber.fromString(current.lstrip("vV"))
+    v2 = QVersionNumber.fromString(latest.lstrip("vV"))
+    return v2 > v1
+
+
+def buildAssetUrl(source: str, version: str, assetName: str) -> str:
+    if source == "gitcode":
+        return f"https://gitcode.com/XiaoYouChR/Ghost-Downloader-3/releases/download/v{version}/{assetName}"
+    return f"https://github.com/XiaoYouChR/Ghost-Downloader-3/releases/download/v{version}/{assetName}"
+
+
+def extractZip(archivePath: Path, targetDir: Path) -> None:
+    with zipfile.ZipFile(archivePath) as zf:
+        zf.extractall(targetDir)
+
+
+def extractTarXz(archivePath: Path, targetDir: Path) -> None:
+    with tarfile.open(archivePath, "r:xz") as tf:
+        tf.extractall(targetDir)
+
+
+async def extractDmg(dmgPath: Path, targetDir: Path) -> None:
+    mountPoint = dmgPath.parent / "_dmg_mount"
+    mountPoint.mkdir(exist_ok=True)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "hdiutil", "attach", str(dmgPath), "-mountpoint", str(mountPoint),
+            "-nobrowse", "-quiet",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"hdiutil attach failed ({proc.returncode})")
+
+        apps = [p for p in mountPoint.iterdir() if p.suffix == ".app"]
+        if not apps:
+            raise RuntimeError("DMG 中未找到 .app")
+
+        await asyncio.to_thread(shutil.copytree, apps[0], targetDir)
+    finally:
+        await asyncio.create_subprocess_exec(
+            "hdiutil", "detach", str(mountPoint), "-quiet",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        if mountPoint.exists():
+            mountPoint.rmdir()
+
+
+def installPendingPacks(featuresDir: Path) -> None:
     if not featuresDir.exists():
         return
     for pending in featuresDir.glob("*_pending"):
@@ -32,12 +105,6 @@ def applyPendingPackUpdates(featuresDir: Path) -> None:
             shutil.rmtree(target)
         pending.rename(target)
         logger.info("已应用 Pack 更新: {}", packId)
-
-
-SOURCES = {
-    "github": "https://github.com/XiaoYouChR/Ghost-Downloader-3/releases/download/v{version}/versions.json",
-    "gitcode": "https://gitcode.com/XiaoYouChR/Ghost-Downloader-3/releases/download/v{version}/versions.json",
-}
 
 
 class UpdateState(IntEnum):
@@ -70,12 +137,6 @@ class UpdateService(QObject):
         self._source = ""
         self._versionsData: dict = {}
 
-    def infoById(self, targetId: str) -> UpdateInfo | None:
-        return self._infos.get(targetId)
-
-    def availableUpdates(self) -> list[UpdateInfo]:
-        return [i for i in self._infos.values() if i.state in (UpdateState.AVAILABLE, UpdateState.READY)]
-
     def check(self) -> None:
         self._coroutineRunner.submit(self._check())
 
@@ -86,12 +147,9 @@ class UpdateService(QObject):
         for info in self._infos.values():
             if info.state == UpdateState.READY and info.targetId != "app":
                 self._applyPack(info.targetId)
-
-    def startUpdater(self) -> None:
-        info = self._infos.get("app")
-        if info is None or info.state != UpdateState.READY:
-            return
-        self._startUpdater()
+        appInfo = self._infos.get("app")
+        if appInfo is not None and appInfo.state == UpdateState.READY:
+            self._startUpdater()
 
     # ── Private ──
 
@@ -106,14 +164,15 @@ class UpdateService(QObject):
 
         appData = data.get("app", {})
         latestVersion = appData.get("version", "")
-        if latestVersion and self._isNewer(VERSION, latestVersion):
+        if latestVersion and isNewer(VERSION, latestVersion):
             self._emit("app", UpdateState.AVAILABLE,
                         label=f"Ghost Downloader {latestVersion}",
                         latestVersion=latestVersion)
+        else:
+            self._emit("app", UpdateState.IDLE)
 
         packsData = data.get("packs", {})
         featuresDir = executableDir / "features"
-        from app.services.pack_loader import PackManifest
         for packDir in sorted(featuresDir.iterdir()) if featuresDir.exists() else []:
             if not packDir.is_dir() or packDir.name.startswith("."):
                 continue
@@ -124,9 +183,9 @@ class UpdateService(QObject):
             if remoteInfo is None:
                 continue
             remoteVersion = remoteInfo.get("version", "")
-            if remoteVersion and self._isNewer(manifest.version, remoteVersion):
+            if remoteVersion and isNewer(manifest.version, remoteVersion):
                 remoteGdMin = remoteInfo.get("gdMinVersion", "")
-                if remoteGdMin and not self._isNewer(remoteGdMin, VERSION) and remoteGdMin != VERSION:
+                if remoteGdMin and not isNewer(remoteGdMin, VERSION) and remoteGdMin != VERSION:
                     logger.debug("跳过 Pack 更新 {}：需要 GD ≥ {}", manifest.name, remoteGdMin)
                     continue
                 self._emit(manifest.name, UpdateState.AVAILABLE,
@@ -135,55 +194,31 @@ class UpdateService(QObject):
                             latestVersion=remoteVersion)
 
     async def _fetchVersions(self) -> dict | None:
-        sources = [self._source] if self._source else list(SOURCES.keys())
+        sources = [self._source] if self._source else list(SOURCES)
         for sourceName in sources:
-            urlTemplate = SOURCES.get(sourceName)
-            if not urlTemplate:
-                continue
             try:
-                url = await self._latestVersionsUrl(sourceName)
-                if not url:
-                    continue
-                client = buildClient(timeout=15)
+                source = SOURCES[sourceName]
+                client = buildClient(headers=source["headers"] or None, timeout=15)
                 try:
-                    response = await client.get(url)
-                    response.raise_for_status()
-                    data = await response.json()
-                    self._source = sourceName
-                    return data
+                    resp = await client.get(source["api"])
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    for asset in data.get("assets", []):
+                        if asset.get("name") == "versions.json":
+                            url = asset.get("browser_download_url", "")
+                            if not url:
+                                continue
+                            response = await client.get(url)
+                            response.raise_for_status()
+                            result = await response.json()
+                            self._source = sourceName
+                            return result
                 finally:
                     client.close()
             except Exception as e:
                 logger.debug("从 {} 获取版本信息失败: {}", sourceName, repr(e))
                 continue
         return None
-
-    async def _latestVersionsUrl(self, sourceName: str) -> str:
-        client = buildClient(headers={"accept": "application/vnd.github+json"}, timeout=15)
-        try:
-            if sourceName == "github":
-                resp = await client.get(
-                    "https://api.github.com/repos/XiaoYouChR/Ghost-Downloader-3/releases/latest"
-                )
-                resp.raise_for_status()
-                data = await resp.json()
-                for asset in data.get("assets", []):
-                    if asset.get("name") == "versions.json":
-                        return asset.get("browser_download_url", "")
-            elif sourceName == "gitcode":
-                resp = await client.get(
-                    "https://gitcode.com/api/v5/repos/XiaoYouChR/Ghost-Downloader-3/releases/latest"
-                )
-                resp.raise_for_status()
-                data = await resp.json()
-                for asset in data.get("assets", []):
-                    if asset.get("name") == "versions.json":
-                        return asset.get("browser_download_url", "")
-        except Exception:
-            pass
-        finally:
-            client.close()
-        return ""
 
     async def _download(self, targetId: str) -> None:
         info = self._infos.get(targetId)
@@ -195,50 +230,79 @@ class UpdateService(QObject):
 
         try:
             if targetId == "app":
-                await self._downloadAppPatch(info)
+                await self._downloadApp(info)
             else:
                 await self._downloadPack(targetId, info)
         except Exception as e:
             logger.opt(exception=e).error("下载更新失败: {}", targetId)
             self._emit(targetId, UpdateState.FAILED, error=str(e))
 
-    async def _downloadAppPatch(self, info: UpdateInfo) -> None:
+    async def _downloadApp(self, info: UpdateInfo) -> None:
         appData = self._versionsData.get("app", {})
-        patchFrom = appData.get("patchFrom", "")
+        version = appData.get("version", "")
+        platformKey = buildPlatformKey()
 
-        if patchFrom == VERSION:
-            url = self._assetUrl(f"patch-{patchFrom}-to-{info.latestVersion}.hdiff")
+        patches = appData.get("patches", {})
+        patch = patches.get(platformKey)
+
+        if patch and patch.get("from") == VERSION:
+            url = buildAssetUrl(self._source, version, patch["file"])
+            sha = patch.get("sha256", "")
             outputPath = STAGING_DIR / "patch.hdiff"
-        else:
-            url = self._bestFullReleaseUrl()
-            if not url:
-                self._emit("app", UpdateState.FAILED, error="未找到适配的安装包")
-                return
-            outputPath = STAGING_DIR / "full_release"
 
-        await fetchFile(url, outputPath, onProgress=lambda p: self._emit("app", UpdateState.DOWNLOADING, progress=p))
+            await fetchFile(url, outputPath,
+                            onProgress=lambda p: self._emit("app", UpdateState.DOWNLOADING, progress=p))
 
-        expectedSha = appData.get("patchSha256" if patchFrom == VERSION else "fullSha256", "")
-        if expectedSha:
-            from app.platform.filesystem import matchChecksum
-            if not matchChecksum(outputPath, expectedSha):
-                outputPath.unlink(missing_ok=True)
+            if sha:
+                if not matchChecksum(outputPath, sha):
+                    outputPath.unlink(missing_ok=True)
+                    self._emit("app", UpdateState.FAILED, error="校验失败")
+                    return
+
+            self._emit("app", UpdateState.READY)
+            return
+
+        full = appData.get("full", {}).get(platformKey)
+        if not full:
+            self._emit("app", UpdateState.FAILED, error="当前平台无可用更新")
+            return
+
+        archivePath = STAGING_DIR / full["file"]
+        sha = full.get("sha256", "")
+
+        await fetchFile(buildAssetUrl(self._source, version, full["file"]), archivePath,
+                        onProgress=lambda p: self._emit("app", UpdateState.DOWNLOADING, progress=p))
+
+        if sha and not matchChecksum(archivePath, sha):
+                archivePath.unlink(missing_ok=True)
                 self._emit("app", UpdateState.FAILED, error="校验失败")
                 return
 
+        appDir = executableDir.parent.parent if sys.platform == "darwin" else executableDir
+        newDir = appDir.parent / f"{appDir.name}_new"
+        if newDir.exists():
+            await asyncio.to_thread(shutil.rmtree, newDir)
+
+        if sys.platform == "darwin":
+            await extractDmg(archivePath, newDir)
+        elif archivePath.suffix == ".xz":
+            await asyncio.to_thread(extractTarXz, archivePath, newDir)
+        else:
+            await asyncio.to_thread(extractZip, archivePath, newDir)
+
+        archivePath.unlink(missing_ok=True)
         self._emit("app", UpdateState.READY)
 
     async def _downloadPack(self, packId: str, info: UpdateInfo) -> None:
+        appVersion = self._versionsData.get("app", {}).get("version", "")
         packData = self._versionsData.get("packs", {}).get(packId, {})
-        url = self._assetUrl(f"{packId}-{info.latestVersion}.zip")
+        url = buildAssetUrl(self._source, appVersion, packData.get("file", f"{packId}-{info.latestVersion}.zip"))
         outputPath = STAGING_DIR / f"{packId}.zip"
 
         await fetchFile(url, outputPath, onProgress=lambda p: self._emit(packId, UpdateState.DOWNLOADING, progress=p))
 
         expectedSha = packData.get("sha256", "")
-        if expectedSha:
-            from app.platform.filesystem import matchChecksum
-            if not matchChecksum(outputPath, expectedSha):
+        if expectedSha and not matchChecksum(outputPath, expectedSha):
                 outputPath.unlink(missing_ok=True)
                 self._emit(packId, UpdateState.FAILED, error="校验失败")
                 return
@@ -251,27 +315,28 @@ class UpdateService(QObject):
             return
         pendingDir = executableDir / "features" / f"{packId}_pending"
         pendingDir.mkdir(parents=True, exist_ok=True)
-        import zipfile
         with zipfile.ZipFile(zipPath) as zf:
             zf.extractall(pendingDir)
         zipPath.unlink()
         logger.info("Pack 更新已暂存: {}", packId)
 
     def _startUpdater(self) -> None:
-        patchPath = STAGING_DIR / "patch.hdiff"
-        if not patchPath.is_file():
-            return
-
         updaterName = "updater.exe" if sys.platform == "win32" else "updater"
         updaterPath = executableDir / updaterName
         if not updaterPath.is_file():
             logger.error("updater not found: {}", updaterPath)
             return
 
-        if sys.platform == "darwin":
-            appDir = executableDir.parent.parent
-        else:
-            appDir = executableDir
+        appDir = executableDir.parent.parent if sys.platform == "darwin" else executableDir
+        patchPath = STAGING_DIR / "patch.hdiff"
+        newDir = appDir.parent / f"{appDir.name}_new"
+
+        args = [str(updaterPath), str(os.getpid()), str(appDir), sys.executable]
+        if patchPath.is_file():
+            args.append(str(patchPath))
+        elif not newDir.is_dir():
+            logger.error("no patch or newDir found for update")
+            return
 
         kwargs = {}
         if sys.platform == "win32":
@@ -279,32 +344,8 @@ class UpdateService(QObject):
         else:
             kwargs["start_new_session"] = True
 
-        subprocess.Popen(
-            [str(updaterPath), str(os.getpid()), str(appDir),
-             str(patchPath), sys.executable],
-            **kwargs,
-        )
+        subprocess.Popen(args, **kwargs)
         logger.info("updater started")
-
-    # ── Helpers ──
-
-    def _assetUrl(self, assetName: str) -> str:
-        appData = self._versionsData.get("app", {})
-        version = appData.get("version", "")
-        if self._source == "gitcode":
-            return f"https://gitcode.com/XiaoYouChR/Ghost-Downloader-3/releases/download/v{version}/{assetName}"
-        return f"https://github.com/XiaoYouChR/Ghost-Downloader-3/releases/download/v{version}/{assetName}"
-
-    def _bestFullReleaseUrl(self) -> str:
-        from app.update import fetchRelease, bestAsset
-        # full release fallback 走已有的 update.py 逻辑选择最佳资产
-        # 这里只返回 URL，实际大文件下载可以走 TaskService
-        return ""
-
-    def _isNewer(self, current: str, latest: str) -> bool:
-        v1 = QVersionNumber.fromString(current.lstrip("vV"))
-        v2 = QVersionNumber.fromString(latest.lstrip("vV"))
-        return v2 > v1
 
     def _emit(self, targetId: str, state: UpdateState, **kwargs) -> None:
         current = self._infos.get(targetId)

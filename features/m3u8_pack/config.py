@@ -188,7 +188,7 @@ class M3U8Runtime(BinaryRuntime):
 
         url, tag = await self._fetchAssetUrl(target)
 
-        from app.models.install import createInstallTask
+        from app.install import createInstallTask
         binaryName = "N_m3u8DL-RE.exe" if sys.platform == "win32" else "N_m3u8DL-RE"
         return await createInstallTask(
             self.parse,

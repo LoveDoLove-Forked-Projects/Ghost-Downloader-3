@@ -1,5 +1,5 @@
 /*
- * Usage:  updater <appPID> <appDir> <patchFile> <appExe>
+ * Usage:  updater <appPID> <appDir> <appExe> [patchFile]
  * Exit:   0 ok · 1 patch · 2 rename · 3 timeout · 4 launch · 5 args
  */
 
@@ -50,17 +50,19 @@ static void toDirname(char *path) {
     else     path[0] = '\0';
 }
 
-static void openLog(const char *patchFile) {
-    strncpy(g_logPath, patchFile, sizeof(g_logPath) - 1);
+static void openLog(const char *appDir) {
+    strncpy(g_logPath, appDir, sizeof(g_logPath) - 1);
     g_logPath[sizeof(g_logPath) - 1] = '\0';
+    toDirname(g_logPath);
 
-    char *sep = strrchr(g_logPath, '/');
+    size_t dirLen = strlen(g_logPath);
+    if (dirLen > 0)
+        snprintf(g_logPath + dirLen, sizeof(g_logPath) - dirLen, "%cupdater.log",
 #ifdef _WIN32
-    char *bsep = strrchr(g_logPath, '\\');
-    if (bsep > sep) sep = bsep;
+                 '\\');
+#else
+                 '/');
 #endif
-    if (sep)
-        snprintf(sep + 1, sizeof(g_logPath) - (size_t)(sep + 1 - g_logPath), "updater.log");
     else
         snprintf(g_logPath, sizeof(g_logPath), "updater.log");
 
@@ -254,29 +256,29 @@ static int startApp(const char *exe) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: updater <appPID> <appDir> <patchFile> <appExe>\n");
+    if (argc < 4 || argc > 5) {
+        fprintf(stderr, "usage: updater <appPID> <appDir> <appExe> [patchFile]\n");
         return EXIT_BAD_ARGS;
     }
 
     unsigned long appPid = strtoul(argv[1], NULL, 10);
     const char   *appDir    = argv[2];
-    const char   *patchFile = argv[3];
-    const char   *appExe    = argv[4];
+    const char   *appExe    = argv[3];
+    const char   *patchFile = argc == 5 ? argv[4] : NULL;
 
     char newDir[PATH_BUF], backupDir[PATH_BUF], updaterDir[PATH_BUF];
     snprintf(newDir,    sizeof(newDir),    "%s_new",    appDir);
     snprintf(backupDir, sizeof(backupDir), "%s_backup", appDir);
     findExeDir(updaterDir, sizeof(updaterDir));
 
-    openLog(patchFile);
+    openLog(appDir);
     logMsg("   __________     __  ______  ____  ___  ________________");
     logMsg("  / ____/ __ \\   / / / / __ \\/ __ \\/   |/_  __/ ____/ __ \\");
     logMsg(" / / __/ / / /  / / / / /_/ / / / / /| | / / / __/ / /_/ /");
     logMsg("/ /_/ / /_/ /  / /_/ / ____/ /_/ / ___ |/ / / /___/ _, _/");
     logMsg("\\____/_____/   \\____/_/   /_____/_/  |_/_/ /_____/_/ |_|");
-    logMsg("parent=%lu appDir=\"%s\" patch=\"%s\" exe=\"%s\"",
-           appPid, appDir, patchFile, appExe);
+    logMsg("pid=%lu appDir=\"%s\" exe=\"%s\" patch=\"%s\"",
+           appPid, appDir, appExe, patchFile ? patchFile : "(full)");
 
     logMsg("waiting for app %lu ...", appPid);
     if (waitForProcessExit(appPid, 30000) != 0) {
@@ -286,16 +288,18 @@ int main(int argc, char *argv[]) {
     }
     logMsg("app exited");
 
-    deleteDir(newDir);
     deleteDir(backupDir);
 
-    if (runHpatchz(updaterDir, appDir, patchFile, newDir) != 0) {
-        logMsg("hpatchz failed");
+    if (patchFile) {
         deleteDir(newDir);
-        closeLog();
-        return EXIT_PATCH_FAILED;
+        if (runHpatchz(updaterDir, appDir, patchFile, newDir) != 0) {
+            logMsg("hpatchz failed");
+            deleteDir(newDir);
+            closeLog();
+            return EXIT_PATCH_FAILED;
+        }
+        logMsg("patch applied");
     }
-    logMsg("patch applied");
 
     int swapOk = 0;
 #ifdef __APPLE__
@@ -321,7 +325,8 @@ int main(int argc, char *argv[]) {
     }
     logMsg("installed");
 
-    remove(patchFile);
+    if (patchFile)
+        remove(patchFile);
 
     logMsg("starting %s", appExe);
     if (startApp(appExe) != 0) {

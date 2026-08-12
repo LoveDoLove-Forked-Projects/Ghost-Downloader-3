@@ -117,7 +117,7 @@ class FFmpegRuntime(BinaryRuntime):
             shutil.rmtree(folder)
 
     async def installTask(self) -> Task:
-        from app.models.install import createInstallTask
+        from app.install import createInstallTask
 
         target = ffmpegAssetTarget()
         extension = "zip" if sys.platform == "win32" else "tar.gz"
