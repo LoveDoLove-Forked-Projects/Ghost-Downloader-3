@@ -43,18 +43,24 @@ def createServices(coroutineRunner, categoryService, speedMeter):
     from app.services.feature_service import FeatureService
     from app.services.runtime_status import RuntimeStatusService
     from app.services.task_service import TaskService
+    from app.services.update_service import UpdateService
 
     taskService = TaskService(coroutineRunner, categoryService, speedMeter)
     runtimeStatusService = RuntimeStatusService(coroutineRunner)
     featureService = FeatureService(taskService, categoryService, coroutineRunner, runtimeStatusService)
     browserService = BrowserService(coroutineRunner, taskService, parse=featureService.parse)
     aria2RpcServer = Aria2RpcServer(coroutineRunner, parse=featureService.parse, addTask=taskService.add)
+    updateService = UpdateService(coroutineRunner)
 
-    return featureService, taskService, browserService, aria2RpcServer
+    return featureService, taskService, browserService, aria2RpcServer, updateService, runtimeStatusService
 
 
 def loadPacks(featureService, coroutineRunner, speedMeter):
     from app.models.pack import PackConfig, PackServices
+    from app.services.update_service import applyPendingPackUpdates
+    from app.config.paths import executableDir
+
+    applyPendingPackUpdates(executableDir / "features")
 
     services = PackServices(
         coroutineRunner=coroutineRunner,
@@ -89,11 +95,14 @@ def checkUpdateAtStartup(coroutineRunner, onUpdateAvailable):
     coroutineRunner.submit(fetchRelease(), done=_onFetched)
 
 
-def stopEngine(taskService, browserService, aria2RpcServer, featureService, coroutineRunner):
+def stopEngine(taskService, browserService, aria2RpcServer, featureService, coroutineRunner, updateService=None):
     taskService.stop()
     taskService.flush()
     browserService.stop()
     aria2RpcServer.stop()
     featureService.deactivate(coroutineRunner)
     taskService.flush()
+    if updateService is not None:
+        updateService.apply()
+        updateService.startUpdater()
     coroutineRunner.stop()

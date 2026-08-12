@@ -64,8 +64,10 @@ def setupEnvironment():
 
 
 def startApp(application, isSilent=False):
+    import shutil
     from PySide6.QtGui import QIcon
     from app.config.cfg import cfg
+    from app.config.paths import executableDir
     from app.services.clipboard_listener import ClipboardListener
     from app.signal_bus import signalBus
     from app.startup import loadEngine, createServices, loadPacks, startEngine, bindNotifications, checkUpdateAtStartup, stopEngine
@@ -86,9 +88,14 @@ def startApp(application, isSilent=False):
 
     coroutineRunner, categoryService, speedMeter = loadEngine(application)
 
+    appDir = executableDir.parent.parent if sys.platform == "darwin" else executableDir
+    backupDir = appDir.parent / f"{appDir.name}_backup"
+    if backupDir.is_dir():
+        shutil.rmtree(backupDir, ignore_errors=True)
+
     MainWindow.refreshThemeColor()
 
-    featureService, taskService, browserService, aria2RpcServer = createServices(
+    featureService, taskService, browserService, aria2RpcServer, updateService, runtimeStatusService = createServices(
         coroutineRunner, categoryService, speedMeter,
     )
     loadPacks(featureService, coroutineRunner, speedMeter)
@@ -109,7 +116,7 @@ def startApp(application, isSilent=False):
         if cfg.isBrowserExtensionEnabled.value:
             browserService.start()  # 提前启动，OOBE 期间可完成扩展配对
 
-        oobe = OobeWindow(browserService, coroutineRunner, featureService, taskService)
+        oobe = OobeWindow(browserService, coroutineRunner, featureService, runtimeStatusService)
         browserService.pairRequested.connect(oobe.onPairRequested)
         oobe.show()
 
@@ -230,7 +237,7 @@ def startApp(application, isSilent=False):
 
     checkUpdateAtStartup(coroutineRunner, onUpdateAvailable=lambda release: show()._onUpdateAvailable(release))
 
-    application.aboutToQuit.connect(lambda: stopEngine(taskService, browserService, aria2RpcServer, featureService, coroutineRunner))
+    application.aboutToQuit.connect(lambda: stopEngine(taskService, browserService, aria2RpcServer, featureService, coroutineRunner, updateService))
 
 
 if __name__ == "__main__":

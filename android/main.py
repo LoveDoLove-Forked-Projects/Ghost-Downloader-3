@@ -65,7 +65,7 @@ def startApp(application):
     sys.excepthook = exceptionHook
 
     coroutineRunner, categoryService, speedMeter = loadEngine(application)
-    featureService, taskService, browserService, aria2RpcServer = createServices(
+    featureService, taskService, browserService, aria2RpcServer, updateService, runtimeStatusService = createServices(
         coroutineRunner, categoryService, speedMeter,
     )
     loadPacks(featureService, coroutineRunner, speedMeter)
